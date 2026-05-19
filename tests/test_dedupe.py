@@ -1,8 +1,9 @@
-"""pHash dedupe behavior."""
+"""Dedupe and click-cooldown behavior."""
 
 from __future__ import annotations
 
 import random
+import time
 
 from PIL import Image
 
@@ -24,25 +25,56 @@ def _noisy(seed: int) -> Image.Image:
     return img
 
 
-def test_first_heartbeat_always_kept() -> None:
-    d = Deduper()
-    assert d.should_keep(_solid((10, 10, 10)), TriggerType.HEARTBEAT) is True
+class TestHeartbeat:
+    def test_first_heartbeat_always_kept(self) -> None:
+        d = Deduper()
+        assert d.should_keep(_solid((10, 10, 10)), TriggerType.HEARTBEAT) is True
+
+    def test_identical_heartbeat_dropped(self) -> None:
+        d = Deduper()
+        d.should_keep(_solid((100, 100, 100)), TriggerType.HEARTBEAT)
+        assert d.should_keep(_solid((100, 100, 100)), TriggerType.HEARTBEAT) is False
+
+    def test_dissimilar_heartbeat_kept(self) -> None:
+        d = Deduper(heartbeat_threshold=5)
+        d.should_keep(_noisy(1), TriggerType.HEARTBEAT)
+        assert d.should_keep(_noisy(99), TriggerType.HEARTBEAT) is True
 
 
-def test_identical_heartbeat_dropped() -> None:
-    d = Deduper()
-    d.should_keep(_solid((100, 100, 100)), TriggerType.HEARTBEAT)
-    assert d.should_keep(_solid((100, 100, 100)), TriggerType.HEARTBEAT) is False
+class TestAlwaysKeep:
+    def test_window_focus_always_kept(self) -> None:
+        d = Deduper()
+        d.should_keep(_solid((50, 50, 50)), TriggerType.WINDOW_FOCUS, "w1")
+        assert d.should_keep(_solid((50, 50, 50)), TriggerType.WINDOW_FOCUS, "w1") is True
+
+    def test_submit_always_kept(self) -> None:
+        d = Deduper()
+        assert d.should_keep(_solid((50, 50, 50)), TriggerType.SUBMIT, "w1") is True
 
 
-def test_dissimilar_heartbeat_kept() -> None:
-    d = Deduper(threshold=5)
-    d.should_keep(_noisy(1), TriggerType.HEARTBEAT)
-    assert d.should_keep(_noisy(99), TriggerType.HEARTBEAT) is True
+class TestClick:
+    def test_first_click_kept(self) -> None:
+        d = Deduper()
+        assert d.should_keep(_solid((10, 10, 10)), TriggerType.CLICK, "Outlook|Inbox") is True
 
+    def test_rapid_second_click_in_same_window_dropped(self) -> None:
+        d = Deduper(click_cooldown_s=2.0)
+        d.should_keep(_solid((10, 10, 10)), TriggerType.CLICK, "Outlook|Inbox")
+        assert d.should_keep(_noisy(1), TriggerType.CLICK, "Outlook|Inbox") is False
 
-def test_non_heartbeat_trigger_always_kept_even_if_identical() -> None:
-    d = Deduper()
-    d.should_keep(_solid((50, 50, 50)), TriggerType.CLICK)
-    # identical pixels, but click is a deliberate user action
-    assert d.should_keep(_solid((50, 50, 50)), TriggerType.CLICK) is True
+    def test_rapid_click_in_different_window_kept(self) -> None:
+        d = Deduper(click_cooldown_s=2.0)
+        d.should_keep(_solid((10, 10, 10)), TriggerType.CLICK, "Outlook|Inbox")
+        # different window key, no cooldown applies
+        assert d.should_keep(_noisy(7), TriggerType.CLICK, "Chrome|SAP") is True
+
+    def test_click_after_cooldown_kept(self) -> None:
+        d = Deduper(click_cooldown_s=0.05)
+        d.should_keep(_noisy(1), TriggerType.CLICK, "w1")
+        time.sleep(0.08)
+        assert d.should_keep(_noisy(99), TriggerType.CLICK, "w1") is True
+
+    def test_click_with_identical_pixels_dropped(self) -> None:
+        d = Deduper(click_cooldown_s=0.0, click_threshold=8)
+        d.should_keep(_solid((100, 100, 100)), TriggerType.CLICK, "w1")
+        assert d.should_keep(_solid((100, 100, 100)), TriggerType.CLICK, "w1") is False

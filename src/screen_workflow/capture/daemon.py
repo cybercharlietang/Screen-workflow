@@ -313,11 +313,12 @@ class Daemon:
         except Exception:  # noqa: BLE001
             log.exception("screenshot grab failed")
             return
-        if not self.deduper.should_keep(image, trigger):
-            log.debug("dedupe dropped %s frame", trigger.value)
+        app, window_title = self.probe()
+        window_key = f"{app}␟{window_title}"
+        if not self.deduper.should_keep(image, trigger, window_key):
+            log.debug("dedupe dropped %s frame (window=%s)", trigger.value, window_title)
             return
         event_id = _new_event_id()
-        app, window_title = self.probe()
         screenshot_path = self.shotter.save(image, event_id)
         now = _now()
         event = Event(
