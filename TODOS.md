@@ -4,6 +4,27 @@ Phase-organized backlog. Move items between phases as priorities shift; do
 not delete completed items (we want the historical trace) — strike them or
 move under a "Done" section per phase.
 
+## PoC scope (today, ~5–6 h budget)
+
+Hard cuts to fit a one-day proof of concept:
+
+- **No SQLCipher / DPAPI.** Plain SQLite + plain `screens/` dir on a
+  BitLocker-protected machine. Encryption-at-rest deferred.
+- **No UI Automation tree.** Window title + OCR carries enough signal for
+  the PoC. UI tree deferred.
+- **No browser extension.** Window title only for browser context.
+- **Minimal session segmenter:** 30-min hard cap + 2-min idle gap. Context-
+  shift detection deferred.
+- **Minimal redaction:** mask only obvious patterns (SSN, full card #).
+  Full config-driven redaction list deferred to legal sign-off.
+- **No HITL review queue UI** (Phase 5). Manual inspection via the
+  static-HTML viewer is enough.
+- **Cross-platform where free.** `mss` + `pynput` + Tesseract work on
+  Linux/Mac too, useful for dev. Production target is still Windows.
+
+Critical path for today: capture → store → batch → label → view → cost.
+Everything else is iteration.
+
 ---
 
 ## Phase 0 — Derisking (status: closed for code-side; annotation work continues in parallel)

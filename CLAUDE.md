@@ -13,6 +13,15 @@ meaningful screen events on a client employee's Windows machine, batches them
 into sessions, and uses Claude to label them under the **CAGE** taxonomy so we
 can estimate the agent-token cost of automating each workflow.
 
+## Scope: proof of concept
+
+This is a **proof of concept**, not production. The goal is end-to-end
+something-that-works that we can iterate on later. Prioritize the critical
+path (capture → label → cost) over edge cases, encryption hardening, full
+test coverage, multi-platform support, or extensive error handling. Skip or
+stub the less important details and flag them in `TODOS.md` for later. We're
+optimizing for "we can demo it" today, not "we can ship it."
+
 ## Stack
 
 - **Language**: Python 3.11+

@@ -124,12 +124,6 @@ class CAGELabel(str, Enum):
     EXTRACT = "E"
 
 
-class Complexity(str, Enum):
-    S = "S"
-    M = "M"
-    L = "L"
-
-
 class ActionUnit(BaseModel):
     """Pass A output: a segmented action before classification."""
 
@@ -153,7 +147,14 @@ class Label(BaseModel):
     cage_label: CAGELabel
     system: str
     data_object: str
-    complexity: Complexity
+    estimated_tokens: int = Field(
+        ge=0,
+        description=(
+            "Claude's per-action estimate of how many tokens an agent would "
+            "consume to perform this action end-to-end. Aggregate across many "
+            "labeled actions to derive per-CAGE-class averages."
+        ),
+    )
     start_ts: datetime
     end_ts: datetime
     evidence_frame_ids: list[str] = Field(min_length=1)
