@@ -13,9 +13,12 @@ typical 1080p screenshot at default detail).
 from __future__ import annotations
 
 import base64
+import io
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from PIL import Image
 
 from screen_workflow.schemas import Event
 
@@ -23,6 +26,14 @@ log = logging.getLogger(__name__)
 
 APPROX_TOKENS_PER_IMAGE = 1500
 DEFAULT_BUDGET = 400_000  # leave headroom below 500K for response generation
+
+# Anthropic per-request size cap is 32 MB. Full-resolution 1080p PNGs are
+# ~1.5 MB each, so a session of 30+ frames overflows that. We resize the
+# longest edge to 1280px and JPEG-encode at q=80 — still highly readable
+# for the model (text and UI elements remain crisp) but ~50-150 KB per
+# image, so a 100-image batch is comfortably ~10 MB.
+IMAGE_RESIZE_MAX_PX = 1280
+IMAGE_JPEG_QUALITY = 80
 SYSTEM_PROMPT = """\
 You are a procurement-workflow analyst at Fragment. You will be shown a
 chronological session of one employee's screen activity: a structured event
@@ -179,16 +190,35 @@ def _select_images(
 
 
 def _image_block(event: Event, screens_root: Path) -> dict | None:
-    p = screens_root / event.screenshot_path
+    """Resize + JPEG-encode the screenshot for the Anthropic request.
+
+    Full-res PNGs are too large for the 32 MB per-request cap once you have
+    20+ frames. 1280px JPEG q=80 keeps text and UI elements readable while
+    shrinking each frame to ~50-150 KB.
+    """
+    # Normalize backslashes to forward slashes so paths stored on Windows
+    # still resolve on POSIX (and remain valid on Windows).
+    rel = event.screenshot_path.replace("\\", "/")
+    p = screens_root / rel
     if not p.exists():
         log.warning("screenshot missing: %s", p)
         return None
-    data = base64.b64encode(p.read_bytes()).decode("ascii")
+    try:
+        with Image.open(p) as im:
+            im = im.convert("RGB")
+            im.thumbnail((IMAGE_RESIZE_MAX_PX, IMAGE_RESIZE_MAX_PX), Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=IMAGE_JPEG_QUALITY, optimize=True)
+            jpeg_bytes = buf.getvalue()
+    except Exception:  # noqa: BLE001
+        log.exception("failed to resize %s; skipping image", p)
+        return None
+    data = base64.b64encode(jpeg_bytes).decode("ascii")
     return {
         "type": "image",
         "source": {
             "type": "base64",
-            "media_type": "image/png",
+            "media_type": "image/jpeg",
             "data": data,
         },
     }

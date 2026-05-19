@@ -46,14 +46,9 @@ def _events_by_id() -> dict:
 
 
 def _png(path: Path) -> None:
+    from PIL import Image as _PIL
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(
-        bytes.fromhex(
-            "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
-            "890000000d49444154789c63000100000005000156a4fa720000000049454e44"
-            "ae426082"
-        )
-    )
+    _PIL.new("RGB", (32, 32), color=(120, 80, 60)).save(path)
 
 
 class TestBatch:

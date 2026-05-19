@@ -112,7 +112,9 @@ class Screenshotter:
         full = self.root / rel
         full.parent.mkdir(parents=True, exist_ok=True)
         image.save(full)
-        return str(rel)
+        # Always store with forward slashes so the same DB is readable on
+        # either OS (Python accepts both separators).
+        return rel.as_posix()
 
 
 # ---------------------------------------------------------------------------
