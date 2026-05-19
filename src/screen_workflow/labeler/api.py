@@ -239,6 +239,50 @@ def _extract_json(text: str) -> dict:
         raise LabelerError(f"response not valid JSON: {e}") from e
 
 
+def _write_audit(
+    root: Path,
+    *,
+    session: Session,
+    batch,
+    response: dict,
+    touched_workflows: dict,
+    observations: list,
+    noise_count: int,
+    model: str,
+    usage,
+) -> None:
+    """Persist what Claude returned for this session, for the Pipeline view."""
+    try:
+        audit_dir = root / "audit"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "session_id": session.session_id,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "model": model,
+            "batch": {
+                "selected_frame_ids": batch.selected_frame_ids,
+                "dropped_frame_ids": batch.dropped_frame_ids,
+                "approx_input_tokens": batch.approx_input_tokens,
+            },
+            "claude_response": response,
+            "summary": {
+                "workflows_touched": [
+                    {"workflow_id": wf.workflow_id, "name": wf.name}
+                    for wf in touched_workflows.values()
+                ],
+                "observations_inserted": len(observations),
+                "noise_actions_count": noise_count,
+                "output_tokens": getattr(usage, "output_tokens", None),
+                "input_tokens": getattr(usage, "input_tokens", None),
+            },
+        }
+        (audit_dir / f"{session.session_id}.json").write_text(
+            json.dumps(payload, indent=2, default=str), encoding="utf-8"
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("failed to write audit log; continuing")
+
+
 # ---------------------------------------------------------------------------
 # Merge: route per-action, create-or-update workflows, persist observations
 # ---------------------------------------------------------------------------
@@ -544,6 +588,21 @@ def process_session(
     )
     for wf in touched.values():
         store.upsert_workflow(wf)
+
+    # Persist a per-session audit JSON so the visualizer (and you) can see
+    # exactly what Claude said for this session — independent of how it got
+    # merged into the workflow graph.
+    _write_audit(
+        store.root,
+        session=session,
+        batch=batch,
+        response=response,
+        touched_workflows=touched,
+        observations=observations,
+        noise_count=noise_count,
+        model=model,
+        usage=getattr(resp, "usage", None),
+    )
 
     log.info(
         "session %s -> %d workflow(s) touched, %d observations, %d noise actions",

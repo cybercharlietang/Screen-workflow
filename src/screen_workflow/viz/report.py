@@ -123,6 +123,20 @@ def _read_status(store_root: Path) -> dict:
         return {"present": False}
 
 
+def _read_audit_logs(store_root: Path) -> list[dict]:
+    """All per-session labeler audit logs, newest first."""
+    audit_dir = store_root / "audit"
+    if not audit_dir.exists():
+        return []
+    out = []
+    for p in sorted(audit_dir.glob("*.json"), reverse=True):
+        try:
+            out.append(json.loads(p.read_text(encoding="utf-8")))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
 def render(
     store: Store,
     out_dir: Path,
@@ -173,6 +187,7 @@ def render(
         "observations": observations,
         "cost_summary": cost_summary,
         "daemon_status": _read_status(store.root),
+        "audit_logs": _read_audit_logs(store.root),
     }
     payload_json = json.dumps(payload, default=str)
 
@@ -260,6 +275,7 @@ __AUTO_REFRESH__
   <button class="tab-btn" data-tab="sessions">Sessions</button>
   <button class="tab-btn" data-tab="workflows">Workflows</button>
   <button class="tab-btn" data-tab="observations">Observations</button>
+  <button class="tab-btn" data-tab="pipeline">Pipeline</button>
   <button class="tab-btn" data-tab="cost">Cost</button>
 </nav>
 <main>
@@ -284,6 +300,9 @@ __AUTO_REFRESH__
       <thead><tr><th>Time</th><th>Workflow Node</th><th>CAGE</th><th>System</th><th>Session</th><th class="num">Conf.</th><th>Frames</th></tr></thead>
       <tbody id="observations-tbody"></tbody>
     </table>
+  </section>
+  <section id="pipeline">
+    <div id="pipeline-content"></div>
   </section>
   <section id="cost">
     <div id="cost-content"></div>
@@ -494,6 +513,82 @@ __AUTO_REFRESH__
       </tr>`;
   });
   if (data.observations.length === 0) otb.innerHTML = '<tr><td colspan="7" class="empty">No observations yet.</td></tr>';
+
+  // Pipeline — per-session diagnostic view
+  const pip = document.getElementById('pipeline-content');
+  const sessionsById = {};
+  data.sessions.forEach(s => { sessionsById[s.session_id] = s; });
+  const auditBySession = {};
+  (data.audit_logs || []).forEach(a => { auditBySession[a.session_id] = a; });
+  const sessionsList = data.sessions.slice().reverse();
+  if (sessionsList.length === 0) {
+    pip.innerHTML = '<p class="empty">No sessions yet. Run the daemon and segmenter first.</p>';
+  } else {
+    let html = '';
+    sessionsList.forEach(s => {
+      const a = auditBySession[s.session_id];
+      const eventsInSession = data.events.filter(e => e.session_id === s.session_id);
+      let inner = `
+        <div style="background:#fff; border:1px solid #ddd; border-radius:6px; padding:14px; margin-bottom:12px">
+          <h3 style="margin:0 0 8px 0; font-size:14px; font-family: ui-monospace, monospace">${escapeHtml(s.session_id)}</h3>
+          <div style="font-size:12px; color:#555; margin-bottom:10px">
+            ${escapeHtml(s.start_ts)} → ${escapeHtml(s.end_ts)} · closed by <b>${escapeHtml(s.close_reason)}</b> · ${eventsInSession.length} events
+          </div>`;
+      if (a) {
+        const sum = a.summary || {};
+        const wfs = sum.workflows_touched || [];
+        const cr = a.claude_response || {};
+        const actions = cr.actions || [];
+        const nonNoise = actions.filter(x => (x.target_workflow_kind || '').toLowerCase() !== 'noise');
+        const noiseActs = actions.filter(x => (x.target_workflow_kind || '').toLowerCase() === 'noise');
+        inner += `
+          <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:8px; font-size:12px; margin-bottom:10px">
+            <div style="background:#f4f4f4; padding:6px 10px; border-radius:4px">
+              <div style="color:#666">Batch frames</div>
+              <div style="font-weight:600">${(a.batch.selected_frame_ids || []).length} selected / ${(a.batch.dropped_frame_ids || []).length} dropped</div>
+            </div>
+            <div style="background:#f4f4f4; padding:6px 10px; border-radius:4px">
+              <div style="color:#666">Input tokens (est)</div>
+              <div style="font-weight:600">${(a.batch.approx_input_tokens || 0).toLocaleString()}</div>
+            </div>
+            <div style="background:#f4f4f4; padding:6px 10px; border-radius:4px">
+              <div style="color:#666">Workflows touched</div>
+              <div style="font-weight:600">${wfs.length}</div>
+            </div>
+            <div style="background:#f4f4f4; padding:6px 10px; border-radius:4px">
+              <div style="color:#666">Actions / noise</div>
+              <div style="font-weight:600">${nonNoise.length} / ${noiseActs.length}</div>
+            </div>
+          </div>`;
+        inner += `<h4 style="margin:10px 0 4px 0; font-size:12px; color:#444">Claude routing decisions</h4>`;
+        inner += `<table style="font-size:12px"><thead><tr><th>Action</th><th>Workflow</th><th>CAGE</th><th class="num">Tokens</th><th class="num">Steps</th><th class="num">Conf.</th><th>Why</th></tr></thead><tbody>`;
+        actions.forEach(act => {
+          const kind = (act.target_workflow_kind || '').toLowerCase();
+          const wfLabel = kind === 'noise'
+            ? '<span style="color:#b91c1c; font-weight:600">NOISE</span>'
+            : (kind === 'new' ? `<span style="color:#1f5fa7">NEW: ${escapeHtml(act.target_workflow_name || '')}</span>`
+                              : `<code>${escapeHtml(act.target_workflow_id || '?')}</code>`);
+          inner += `<tr>
+              <td>${escapeHtml(act.canonical_name || act.node_id || '?')}</td>
+              <td>${wfLabel}</td>
+              <td>${kind !== 'noise' ? '<span class="pill pill-' + (act.cage_label||'') + '">' + (act.cage_label||'') + '</span>' : ''}</td>
+              <td class="num">${(act.estimated_tokens || 0).toLocaleString()}</td>
+              <td class="num">${act.expected_agent_steps || ''}</td>
+              <td class="num">${(act.confidence != null) ? Number(act.confidence).toFixed(2) : ''}</td>
+              <td>${escapeHtml(act.rationale || '')}</td>
+            </tr>`;
+        });
+        inner += `</tbody></table>`;
+        inner += `<details style="margin-top:8px"><summary style="font-size:12px; color:#666; cursor:pointer">Raw Claude response JSON</summary>
+                  <pre style="background:#f4f4f4; padding:8px; font-size:11px; overflow:auto">${escapeHtml(JSON.stringify(cr, null, 2))}</pre></details>`;
+      } else {
+        inner += `<div class="empty" style="font-size:12px">Not yet labeled. Run <code>screen-workflow-label</code> to process this session.</div>`;
+      }
+      inner += `</div>`;
+      html += inner;
+    });
+    pip.innerHTML = html;
+  }
 
   // Cost
   const ctc = document.getElementById('cost-content');
