@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from screen_workflow.capture.dedupe import Deduper
 from screen_workflow.capture.filter import RawEvent, classify
 from screen_workflow.schemas import Event, InputEvent, TriggerType
 from screen_workflow.storage.db import Store
@@ -90,23 +91,26 @@ class Screenshotter:
 
             self._impl = "pil"
 
-    def grab(self, event_id: str) -> str:
-        """Save a PNG of the primary monitor, return relative path."""
+    def grab_pil(self):
+        """Return a PIL.Image of the primary monitor without writing to disk."""
+        if self._impl == "mss":
+            import mss
+            from PIL import Image
+
+            with mss.mss() as sct:
+                shot = sct.grab(sct.monitors[1])
+                return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        from PIL import ImageGrab
+
+        return ImageGrab.grab()
+
+    def save(self, image, event_id: str) -> str:
+        """Persist a PIL image, return path relative to ``screens_root``."""
         d = datetime.now(timezone.utc)
         rel = Path(f"{d.year:04d}/{d.month:02d}/{d.day:02d}/{event_id}.png")
         full = self.root / rel
         full.parent.mkdir(parents=True, exist_ok=True)
-        if self._impl == "mss":
-            import mss
-            import mss.tools
-
-            with mss.mss() as sct:
-                shot = sct.grab(sct.monitors[1])  # primary monitor
-                mss.tools.to_png(shot.rgb, shot.size, output=str(full))
-        else:
-            from PIL import ImageGrab
-
-            ImageGrab.grab().save(full)
+        image.save(full)
         return str(rel)
 
 
@@ -198,6 +202,7 @@ class Daemon:
     def __init__(self, root: Path) -> None:
         self.store = Store(root)
         self.shotter = Screenshotter(self.store.screens_dir)
+        self.deduper = Deduper()
         self.probe = _make_active_window_probe()
         self.raw_q: queue.Queue[RawEvent] = queue.Queue()
         self._stop = threading.Event()
@@ -254,9 +259,13 @@ class Daemon:
     # -- capture -----------------------------------------------------------
 
     def _capture(self, trigger: TriggerType, target_label: str | None) -> None:
+        image = self.shotter.grab_pil()
+        if not self.deduper.should_keep(image, trigger):
+            log.debug("dedupe dropped %s frame", trigger.value)
+            return
         event_id = _new_event_id()
         app, window_title = self.probe()
-        screenshot_path = self.shotter.grab(event_id)
+        screenshot_path = self.shotter.save(image, event_id)
         event = Event(
             event_id=event_id,
             ts=_now(),
