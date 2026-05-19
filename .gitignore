@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Tooling
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+*.cover
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific — these MUST NEVER be committed
+# Local capture artifacts: raw screenshots, encrypted DBs, transient logs.
+screens/
+events.db
+events.db-journal
+*.db
+*.db-shm
+*.db-wal
+local_data/
+secrets/
+.env
+.env.local

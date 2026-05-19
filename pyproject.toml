@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "screen-workflow"
+version = "0.1.0"
+description = "Procurement-workflow discovery via screen-activity capture and CAGE labeling."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Screen-workflow team" }]
+license = { text = "Proprietary" }
+
+dependencies = [
+    "anthropic>=0.40.0",
+    "pydantic>=2.6",
+    "Pillow>=10.0",
+    "imagehash>=4.3",
+    "psutil>=5.9",
+    "pynput>=1.7",
+    "pywinctl>=0.3",
+    "cryptography>=42.0",
+    "structlog>=24.1",
+]
+
+[project.optional-dependencies]
+windows = [
+    # Native Windows-only deps installed only on Windows hosts.
+    "winrt-Windows.Media.Ocr; sys_platform == 'win32'",
+    "winrt-Windows.Graphics.Imaging; sys_platform == 'win32'",
+    "pywinauto>=0.6; sys_platform == 'win32'",
+    "comtypes>=1.2; sys_platform == 'win32'",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+screen-workflowd = "screen_workflow.daemon:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "RUF"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
