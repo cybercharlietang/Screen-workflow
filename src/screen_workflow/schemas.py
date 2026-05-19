@@ -150,9 +150,18 @@ class Label(BaseModel):
     estimated_tokens: int = Field(
         ge=0,
         description=(
-            "Claude's per-action estimate of how many tokens an agent would "
-            "consume to perform this action end-to-end. Aggregate across many "
-            "labeled actions to derive per-CAGE-class averages."
+            "Claude's estimate of tokens an agent would consume in a single "
+            "LLM call to perform this action (input + output combined). "
+            "Multiply by expected_agent_steps for a multi-step estimate."
+        ),
+    )
+    expected_agent_steps: int = Field(
+        ge=1,
+        default=1,
+        description=(
+            "How many sequential LLM calls a real agent would likely make to "
+            "complete this action (e.g. read context, decide, write output). "
+            "Total cost ≈ estimated_tokens × expected_agent_steps."
         ),
     )
     start_ts: datetime

@@ -58,17 +58,18 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 
 CREATE TABLE IF NOT EXISTS labels (
-    action_id          TEXT PRIMARY KEY,
-    session_id         TEXT NOT NULL,
-    cage_label         TEXT NOT NULL,
-    system             TEXT NOT NULL,
-    data_object        TEXT NOT NULL,
-    estimated_tokens   INTEGER NOT NULL,
-    start_ts           TEXT NOT NULL,
-    end_ts             TEXT NOT NULL,
-    evidence_frame_ids TEXT NOT NULL,
-    confidence         REAL NOT NULL,
-    rationale          TEXT NOT NULL
+    action_id            TEXT PRIMARY KEY,
+    session_id           TEXT NOT NULL,
+    cage_label           TEXT NOT NULL,
+    system               TEXT NOT NULL,
+    data_object          TEXT NOT NULL,
+    estimated_tokens     INTEGER NOT NULL,
+    expected_agent_steps INTEGER NOT NULL DEFAULT 1,
+    start_ts             TEXT NOT NULL,
+    end_ts               TEXT NOT NULL,
+    evidence_frame_ids   TEXT NOT NULL,
+    confidence           REAL NOT NULL,
+    rationale            TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_labels_session ON labels(session_id);
 """
@@ -167,7 +168,7 @@ class Store:
 
     def insert_label(self, label: Label) -> None:
         self._conn.execute(
-            "INSERT OR REPLACE INTO labels VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO labels VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 label.action_id,
                 label.session_id,
@@ -175,6 +176,7 @@ class Store:
                 label.system,
                 label.data_object,
                 label.estimated_tokens,
+                label.expected_agent_steps,
                 label.start_ts.isoformat(),
                 label.end_ts.isoformat(),
                 json.dumps(label.evidence_frame_ids),
@@ -199,11 +201,12 @@ class Store:
                 system=row[3],
                 data_object=row[4],
                 estimated_tokens=row[5],
-                start_ts=datetime.fromisoformat(row[6]),
-                end_ts=datetime.fromisoformat(row[7]),
-                evidence_frame_ids=json.loads(row[8]),
-                confidence=row[9],
-                rationale=row[10],
+                expected_agent_steps=row[6],
+                start_ts=datetime.fromisoformat(row[7]),
+                end_ts=datetime.fromisoformat(row[8]),
+                evidence_frame_ids=json.loads(row[9]),
+                confidence=row[10],
+                rationale=row[11],
             )
 
     def close(self) -> None:

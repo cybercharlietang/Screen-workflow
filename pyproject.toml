@@ -39,6 +39,8 @@ dev = [
 [project.scripts]
 screen-workflowd = "screen_workflow.capture.daemon:main"
 screen-workflow-live = "screen_workflow.live:main"
+screen-workflow-segment = "screen_workflow.session.segmenter:main"
+screen-workflow-label = "screen_workflow.labeler.api:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
