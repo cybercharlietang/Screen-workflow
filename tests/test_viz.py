@@ -26,9 +26,10 @@ T0 = datetime(2026, 5, 19, 10, 0, 0, tzinfo=timezone.utc)
 
 def test_render_produces_self_contained_html(tmp_path: Path) -> None:
     store = Store(tmp_path / "data")
+    from PIL import Image as _PIL
     png = store.screens_dir / "2026/05/19/abc.png"
     png.parent.mkdir(parents=True, exist_ok=True)
-    png.write_bytes(_TINY_PNG)
+    _PIL.new("RGB", (32, 32), color=(120, 80, 60)).save(png)
     store.insert_event(
         Event(
             event_id="abc",
@@ -88,7 +89,7 @@ def test_render_produces_self_contained_html(tmp_path: Path) -> None:
 
     assert out.name == "index.html"
     assert "<!doctype html>" in contents
-    assert "data:image/png;base64," in contents
+    assert "data:image/jpeg;base64," in contents  # thumbnails are JPEG now
     assert "Demo" in contents              # workflow name in payload
     assert "Open thing" in contents        # node name
 

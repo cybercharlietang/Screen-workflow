@@ -9,12 +9,24 @@ from __future__ import annotations
 
 import base64
 import html
+import io
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 
+from PIL import Image
+
 from screen_workflow.schemas import Event, Observation, Session, Workflow
 from screen_workflow.storage.db import Store
+
+log = logging.getLogger(__name__)
+
+# Visualizer cap: too many full-res screenshots crash the browser. We render
+# the N most-recent events with thumbnails. The full DB still has everything.
+MAX_EVENTS_RENDERED = 100
+THUMBNAIL_MAX_PX = 480
+THUMBNAIL_JPEG_QUALITY = 60
 
 
 def _ts(dt: datetime) -> str:
@@ -22,10 +34,25 @@ def _ts(dt: datetime) -> str:
 
 
 def _img_data_uri(path: Path) -> str:
+    """Encode the screenshot as a thumbnail JPEG data URI.
+
+    Resizes longest edge to ``THUMBNAIL_MAX_PX`` and encodes JPEG at
+    ``THUMBNAIL_JPEG_QUALITY``. Cuts a typical 1080p PNG (~1.5 MB) down to
+    20–60 KB so the page stays under 10 MB even with 100 events.
+    """
     if not path.exists():
         return ""
-    b64 = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:image/png;base64,{b64}"
+    try:
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            im.thumbnail((THUMBNAIL_MAX_PX, THUMBNAIL_MAX_PX), Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=THUMBNAIL_JPEG_QUALITY, optimize=True)
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            return f"data:image/jpeg;base64,{b64}"
+    except Exception:  # noqa: BLE001
+        log.exception("thumbnail failed for %s; skipping", path)
+        return ""
 
 
 def _event_dict(e: Event, screens_root: Path) -> dict:
@@ -145,7 +172,12 @@ def render(
 ) -> Path:
     """Write a self-contained HTML report to ``out_dir/index.html``."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    events = [_event_dict(e, store.screens_dir) for e in store.iter_events(session_id)]
+    all_events = list(store.iter_events(session_id))
+    total_events = len(all_events)
+    # Cap to most-recent N to keep the HTML page responsive.
+    if total_events > MAX_EVENTS_RENDERED:
+        all_events = all_events[-MAX_EVENTS_RENDERED:]
+    events = [_event_dict(e, store.screens_dir) for e in all_events]
     sessions = [_session_dict(s) for s in store.iter_sessions()]
     workflows = [_workflow_dict(w) for w in store.iter_workflows()]
     node_lookup = {
@@ -182,6 +214,8 @@ def render(
         "generated_at": _ts(datetime.now()),
         "session_filter": session_id,
         "events": events,
+        "events_total_in_db": total_events,
+        "events_rendered_cap": MAX_EVENTS_RENDERED,
         "sessions": sessions,
         "workflows": workflows,
         "observations": observations,
@@ -320,8 +354,12 @@ __AUTO_REFRESH__
 <script>
 (function () {
   const data = JSON.parse(document.getElementById('payload').textContent);
+  const totalInDb = data.events_total_in_db || data.events.length;
+  const eventsCountMsg = (totalInDb > data.events.length)
+    ? `${data.events.length} of ${totalInDb} events shown (most recent)`
+    : `${data.events.length} events`;
   document.getElementById('meta-line').textContent =
-    `Generated ${data.generated_at} — ${data.events.length} events, ${data.sessions.length} sessions, ${data.labels.length} labels`;
+    `Generated ${data.generated_at} — ${eventsCountMsg}, ${data.sessions.length} sessions, ${data.workflows.length} workflows`;
 
   // Daemon status
   (function () {
