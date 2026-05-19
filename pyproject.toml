@@ -15,12 +15,9 @@ dependencies = [
     "anthropic>=0.40.0",
     "pydantic>=2.6",
     "Pillow>=10.0",
-    "imagehash>=4.3",
-    "psutil>=5.9",
+    "mss>=9.0",
     "pynput>=1.7",
     "pywinctl>=0.3",
-    "cryptography>=42.0",
-    "structlog>=24.1",
 ]
 
 [project.optional-dependencies]
@@ -39,7 +36,7 @@ dev = [
 ]
 
 [project.scripts]
-screen-workflowd = "screen_workflow.daemon:main"
+screen-workflowd = "screen_workflow.capture.daemon:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

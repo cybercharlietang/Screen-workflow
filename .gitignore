@@ -45,3 +45,4 @@ local_data/
 secrets/
 .env
 .env.local
+viz_output/
