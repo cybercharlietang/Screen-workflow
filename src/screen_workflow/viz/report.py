@@ -338,15 +338,27 @@ __AUTO_REFRESH__
     }
   })();
 
-  // Tabs
+  // Tabs — persist selection in URL hash so meta-refresh doesn't reset it.
+  function activateTab(name) {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('section').forEach(s => s.classList.remove('active'));
+    const btn = document.querySelector('.tab-btn[data-tab="' + name + '"]');
+    const sec = document.getElementById(name);
+    if (btn && sec) {
+      btn.classList.add('active');
+      sec.classList.add('active');
+    }
+  }
   document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.addEventListener('click', () => {
-      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-      document.querySelectorAll('section').forEach(s => s.classList.remove('active'));
-      btn.classList.add('active');
-      document.getElementById(btn.dataset.tab).classList.add('active');
+      const t = btn.dataset.tab;
+      window.location.hash = '#' + t;
+      activateTab(t);
     });
   });
+  // Restore from hash on load
+  const initial = (window.location.hash || '#events').slice(1);
+  activateTab(initial);
 
   // Events
   const tbody = document.getElementById('events-tbody');
