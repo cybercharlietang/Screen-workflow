@@ -6,19 +6,42 @@ move under a "Done" section per phase.
 
 ---
 
-## Phase 0 — Derisking (do these before serious code)
+## Phase 0 — Derisking (status: closed for code-side; annotation work continues in parallel)
 
-- [ ] Confirm signed ZDR (Zero-Data-Retention) agreement with Anthropic
-      covering the API key used by the labeler.
-- [ ] Draft initial redaction list with legal + client: which procurement
-      fields are signal we must keep (vendor name, PO #, GL code, $) vs.
-      PII we must mask. See `LESSONS.md` § L7.
-- [ ] Recruit 2 internal annotators; label 10–20 hours of internal screen
-      activity manually under the CAGE taxonomy. Measure inter-rater
-      agreement; refine the taxonomy until agreement is acceptable
-      (target Cohen's κ ≥ 0.7). See `LESSONS.md` § L6.
-- [ ] Decide local DB encryption-at-rest mechanism (SQLCipher vs.
-      `cryptography` Fernet over the file).
+- [x] Confirm signed ZDR (Zero-Data-Retention) agreement with Anthropic.
+- [x] Legal sign-off in place.
+- [~] 2 internal annotators are designing ~5 procurement workflows with
+      noise + ideal CAGE-labeled traces (golden-output dataset). Inter-rater
+      κ to be measured by independent cross-labeling per
+      `docs/annotation_prompt.md`. Tracked separately from code work.
+- [x] Local encryption mechanism decided: **SQLCipher** for `events.db` +
+      **Fernet** for `screens/*.png`, master key wrapped via Windows DPAPI.
+      Defense-in-depth above BitLocker.
+- [ ] Redaction list — still needs legal + client sign-off on signal vs.
+      PII (vendor name, PO #, GL code, $ are signal; SSN, full card #,
+      password fields are masked). Daemon will treat as config, so list
+      can be finalized in parallel with Phase 1.
+
+## Cross-cutting — Visualizer and tests (built alongside every phase)
+
+A single Streamlit app at `src/screen_workflow/viz/app.py` that grows tabs
+as each phase ships. Each phase also produces a `tests/fixtures/phaseN/`
+canned dataset that doubles as the visualizer's demo data, so we never
+need to capture live screens to verify.
+
+- [ ] `viz/` package + Streamlit entry point; reads the local DB + `screens/`.
+- [ ] **Tab — Events** (Phase 1): chronological event table; row click
+      → screenshot + OCR text + UI tree dump.
+- [ ] **Tab — Sessions** (Phase 2): timeline with session boundaries.
+- [ ] **Tab — Batches** (Phase 3): preview of the Claude request
+      (event-log table + selected images + token count, no API call).
+- [ ] **Tab — Labels** (Phase 4): input frames + Claude's segmentation +
+      CAGE labels + confidence + rationale, side by side.
+- [ ] **Tab — Cost** (Phase 5): aggregate token-cost estimates.
+- [ ] Per-phase test layout: `tests/test_phase{N}_*.py` + fixture dir.
+      Use snapshot tests (`syrupy` or hand-rolled) for stage outputs.
+- [ ] `--smoke` mode on the daemon: 60 s real capture into a sandbox DB
+      for local manual verification (not run in CI).
 
 ## Phase 1 — Capture daemon (Windows)
 
