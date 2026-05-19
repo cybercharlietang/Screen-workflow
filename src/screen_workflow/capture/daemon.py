@@ -16,6 +16,7 @@ than crashing.
 
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import sys
@@ -207,6 +208,32 @@ class Daemon:
         self.raw_q: queue.Queue[RawEvent] = queue.Queue()
         self._stop = threading.Event()
         self._last_app_title: tuple[str, str] | None = None
+        self._status_path = self.store.root / "_status.json"
+        self._events_captured = 0
+        self._last_event_ts: datetime | None = None
+        self._started_at: datetime | None = None
+        self._write_status(alive=False, listeners_ok=None, last_error=None)
+
+    def _write_status(
+        self,
+        *,
+        alive: bool,
+        listeners_ok: bool | None,
+        last_error: str | None,
+    ) -> None:
+        try:
+            payload = {
+                "alive": alive,
+                "listeners_ok": listeners_ok,
+                "events_captured": self._events_captured,
+                "last_event_ts": self._last_event_ts.isoformat() if self._last_event_ts else None,
+                "started_at": self._started_at.isoformat() if self._started_at else None,
+                "heartbeat_ts": _now().isoformat(),
+                "last_error": last_error,
+            }
+            self._status_path.write_text(json.dumps(payload), encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            log.debug("could not write status file", exc_info=True)
 
     # -- threads -----------------------------------------------------------
 
@@ -231,16 +258,35 @@ class Daemon:
 
     def run(self, seconds: float | None = None) -> None:
         log.info("daemon starting, root=%s", self.store.root)
-        ml, kl = _start_pynput_listeners(self.raw_q)
+        self._started_at = _now()
+        listeners_ok = False
+        last_error: str | None = None
+        ml = kl = None
+        try:
+            ml, kl = _start_pynput_listeners(self.raw_q)
+            listeners_ok = True
+            log.info("input listeners attached (pynput): mouse + keyboard OK")
+        except Exception as e:  # noqa: BLE001
+            last_error = f"pynput listener failed: {e!r}"
+            log.error(
+                "%s — daemon will still run heartbeat + window-focus, but won't see clicks/keys",
+                last_error,
+            )
+        self._write_status(alive=True, listeners_ok=listeners_ok, last_error=last_error)
+
         heartbeat = threading.Thread(target=self._heartbeat_thread, daemon=True)
         winprobe = threading.Thread(target=self._window_probe_thread, daemon=True)
         heartbeat.start()
         winprobe.start()
         start = time.monotonic()
+        last_status_write = 0.0
         try:
             while not self._stop.is_set():
                 if seconds is not None and (time.monotonic() - start) >= seconds:
                     break
+                if time.monotonic() - last_status_write > 1.0:
+                    self._write_status(alive=True, listeners_ok=listeners_ok, last_error=last_error)
+                    last_status_write = time.monotonic()
                 try:
                     raw = self.raw_q.get(timeout=0.25)
                 except queue.Empty:
@@ -251,24 +297,32 @@ class Daemon:
                 self._capture(result.trigger, result.target_label)
         finally:
             self._stop.set()
-            ml.stop()
-            kl.stop()
+            if ml is not None:
+                ml.stop()
+            if kl is not None:
+                kl.stop()
+            self._write_status(alive=False, listeners_ok=listeners_ok, last_error=last_error)
             self.store.close()
-            log.info("daemon stopped")
+            log.info("daemon stopped — captured %d events", self._events_captured)
 
     # -- capture -----------------------------------------------------------
 
     def _capture(self, trigger: TriggerType, target_label: str | None) -> None:
-        image = self.shotter.grab_pil()
+        try:
+            image = self.shotter.grab_pil()
+        except Exception:  # noqa: BLE001
+            log.exception("screenshot grab failed")
+            return
         if not self.deduper.should_keep(image, trigger):
             log.debug("dedupe dropped %s frame", trigger.value)
             return
         event_id = _new_event_id()
         app, window_title = self.probe()
         screenshot_path = self.shotter.save(image, event_id)
+        now = _now()
         event = Event(
             event_id=event_id,
-            ts=_now(),
+            ts=now,
             app=app,
             window_title=window_title,
             trigger=InputEvent(type=trigger, target_label=target_label),
@@ -276,6 +330,8 @@ class Daemon:
             ocr_text="",
         )
         self.store.insert_event(event)
+        self._events_captured += 1
+        self._last_event_ts = now
         log.info("captured %s [%s] %s — %s", event_id, trigger.value, app, window_title)
 
 

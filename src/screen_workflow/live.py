@@ -65,28 +65,6 @@ def _serve(out_dir: Path, port: int, stop: threading.Event) -> None:
             httpd.handle_request()
 
 
-_LIVE_TEMPLATE_HEAD = '<meta http-equiv="refresh" content="3">'
-
-
-def _inject_auto_refresh(html_path: Path) -> None:
-    """Inject a meta-refresh tag so the page reloads every few seconds."""
-    if not html_path.exists():
-        return
-    text = html_path.read_text(encoding="utf-8")
-    if _LIVE_TEMPLATE_HEAD in text:
-        return
-    text = text.replace("<head>", f"<head>\n{_LIVE_TEMPLATE_HEAD}", 1)
-    html_path.write_text(text, encoding="utf-8")
-
-
-def _refresh_injector_loop(out_dir: Path, stop: threading.Event) -> None:
-    """Each time the renderer writes a fresh index.html (no auto-refresh tag),
-    re-inject the meta-refresh so the browser keeps reloading."""
-    while not stop.is_set():
-        _inject_auto_refresh(out_dir / "index.html")
-        stop.wait(1.0)
-
-
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="screen_workflow.live")
     p.add_argument("--root", default="./local_data", help="capture storage dir")
@@ -110,7 +88,6 @@ def main(argv: list[str] | None = None) -> int:
     store = Store(root)
     render(store, out_dir)
     store.close()
-    _inject_auto_refresh(out_dir / "index.html")
 
     stop = threading.Event()
     daemon = Daemon(root)
@@ -121,15 +98,11 @@ def main(argv: list[str] | None = None) -> int:
     rerender_thread = threading.Thread(
         target=_rerender_loop, args=(root, out_dir, stop), daemon=True
     )
-    injector_thread = threading.Thread(
-        target=_refresh_injector_loop, args=(out_dir, stop), daemon=True
-    )
     server_thread = threading.Thread(
         target=_serve, args=(out_dir, args.port, stop), daemon=True
     )
     daemon_thread.start()
     rerender_thread.start()
-    injector_thread.start()
     server_thread.start()
 
     url = f"http://localhost:{args.port}/"

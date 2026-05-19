@@ -70,7 +70,25 @@ def _label_dict(l: Label) -> dict:
     }
 
 
-def render(store: Store, out_dir: Path, session_id: str | None = None) -> Path:
+def _read_status(store_root: Path) -> dict:
+    """Read the daemon's status file if present."""
+    p = store_root / "_status.json"
+    if not p.exists():
+        return {"present": False}
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        d["present"] = True
+        return d
+    except Exception:  # noqa: BLE001
+        return {"present": False}
+
+
+def render(
+    store: Store,
+    out_dir: Path,
+    session_id: str | None = None,
+    auto_refresh: bool = True,
+) -> Path:
     """Write a self-contained HTML report to ``out_dir/index.html``."""
     out_dir.mkdir(parents=True, exist_ok=True)
     events = [_event_dict(e, store.screens_dir) for e in store.iter_events(session_id)]
@@ -90,12 +108,19 @@ def render(store: Store, out_dir: Path, session_id: str | None = None) -> Path:
         "sessions": sessions,
         "labels": labels,
         "cost_summary": cost_summary,
+        "daemon_status": _read_status(store.root),
     }
     payload_json = json.dumps(payload, default=str)
 
-    html_out = _TEMPLATE.replace("__PAYLOAD_JSON__", payload_json).replace(
-        "__TITLE__",
-        html.escape(f"Screen-workflow report — {session_id or 'all sessions'}"),
+    refresh_meta = '<meta http-equiv="refresh" content="3">' if auto_refresh else ""
+
+    html_out = (
+        _TEMPLATE.replace("__PAYLOAD_JSON__", payload_json)
+        .replace(
+            "__TITLE__",
+            html.escape(f"Screen-workflow report — {session_id or 'all sessions'}"),
+        )
+        .replace("__AUTO_REFRESH__", refresh_meta)
     )
 
     out_path = out_dir / "index.html"
@@ -107,12 +132,22 @@ _TEMPLATE = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+__AUTO_REFRESH__
 <title>__TITLE__</title>
 <style>
   body { font: 14px/1.4 system-ui, sans-serif; margin: 0; color: #222; background: #fafafa; }
-  header { padding: 12px 20px; background: #1a1a1a; color: #fff; }
-  header h1 { margin: 0; font-size: 16px; font-weight: 500; }
+  header { padding: 12px 20px; background: #1a1a1a; color: #fff; display: flex; align-items: center; gap: 16px; }
+  header h1 { margin: 0; font-size: 16px; font-weight: 500; flex: 1; }
   header .meta { font-size: 12px; color: #aaa; margin-top: 4px; }
+  header .status-card { background: #2a2a32; border-radius: 6px; padding: 8px 12px; font-size: 12px; min-width: 280px; }
+  header .status-card .row { display: flex; justify-content: space-between; gap: 12px; }
+  header .status-card .row + .row { margin-top: 2px; }
+  header .status-card .label { color: #888; }
+  header .status-card .value { color: #fff; font-variant-numeric: tabular-nums; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .badge-ok { background: #1f7a4d; color: #fff; }
+  .badge-warn { background: #d97706; color: #fff; }
+  .badge-bad { background: #b91c1c; color: #fff; }
   nav { display: flex; gap: 0; background: #fff; border-bottom: 1px solid #ddd; padding: 0 20px; }
   nav button { background: none; border: none; padding: 12px 16px; cursor: pointer; font-size: 14px; color: #555; border-bottom: 2px solid transparent; }
   nav button.active { color: #1a1a1a; border-bottom-color: #1a1a1a; font-weight: 500; }
@@ -145,8 +180,16 @@ _TEMPLATE = r"""<!doctype html>
 </head>
 <body>
 <header>
-  <h1>__TITLE__</h1>
-  <div class="meta" id="meta-line"></div>
+  <div style="flex:1">
+    <h1>__TITLE__</h1>
+    <div class="meta" id="meta-line"></div>
+  </div>
+  <div class="status-card" id="status-card">
+    <div class="row"><span class="label">Daemon</span><span class="value" id="status-daemon">—</span></div>
+    <div class="row"><span class="label">Listeners</span><span class="value" id="status-listeners">—</span></div>
+    <div class="row"><span class="label">Events captured</span><span class="value" id="status-events">—</span></div>
+    <div class="row"><span class="label">Last event</span><span class="value" id="status-last">—</span></div>
+  </div>
 </header>
 <nav>
   <button class="tab-btn active" data-tab="events">Events</button>
@@ -188,6 +231,52 @@ _TEMPLATE = r"""<!doctype html>
   const data = JSON.parse(document.getElementById('payload').textContent);
   document.getElementById('meta-line').textContent =
     `Generated ${data.generated_at} — ${data.events.length} events, ${data.sessions.length} sessions, ${data.labels.length} labels`;
+
+  // Daemon status
+  (function () {
+    const s = data.daemon_status || {present: false};
+    const d = document.getElementById('status-daemon');
+    const l = document.getElementById('status-listeners');
+    const ev = document.getElementById('status-events');
+    const last = document.getElementById('status-last');
+
+    if (!s.present) {
+      d.innerHTML = '<span class="badge badge-bad">no status file</span>';
+      l.textContent = '—'; ev.textContent = '—'; last.textContent = '—';
+      return;
+    }
+    // Daemon alive?
+    let alive = !!s.alive;
+    // staleness: heartbeat older than 8s = stale
+    let stale = false;
+    if (s.heartbeat_ts) {
+      const hb = new Date(s.heartbeat_ts).getTime();
+      const age = (Date.now() - hb) / 1000;
+      if (age > 8) stale = true;
+    }
+    if (alive && !stale) {
+      d.innerHTML = '<span class="badge badge-ok">alive</span>';
+    } else if (alive && stale) {
+      d.innerHTML = '<span class="badge badge-warn">stale</span>';
+    } else {
+      d.innerHTML = '<span class="badge badge-bad">stopped</span>';
+    }
+    if (s.listeners_ok === true) {
+      l.innerHTML = '<span class="badge badge-ok">ok</span>';
+    } else if (s.listeners_ok === false) {
+      l.innerHTML = '<span class="badge badge-bad">failed</span>';
+    } else {
+      l.textContent = '—';
+    }
+    ev.textContent = s.events_captured != null ? s.events_captured : '—';
+    last.textContent = s.last_event_ts ? s.last_event_ts.substring(11, 19) + ' UTC' : 'never';
+    if (s.last_error) {
+      const errDiv = document.createElement('div');
+      errDiv.style.cssText = 'background:#b91c1c;color:#fff;padding:6px 10px;font-size:12px;';
+      errDiv.textContent = 'Daemon error: ' + s.last_error;
+      document.body.insertBefore(errDiv, document.body.firstChild.nextSibling);
+    }
+  })();
 
   // Tabs
   document.querySelectorAll('.tab-btn').forEach(btn => {
