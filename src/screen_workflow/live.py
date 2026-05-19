@@ -1,0 +1,165 @@
+"""Live mode: daemon + auto-rerender + HTTP server, one command.
+
+Usage::
+
+    python -m screen_workflow.live --root ./local_data --port 8765
+
+Runs the capture daemon in a thread, periodically re-renders the static
+HTML report into ``viz_output/``, and serves that directory on localhost.
+The user opens ``http://localhost:8765/`` and watches events appear as
+they work — the browser tab refreshes itself every few seconds.
+"""
+
+from __future__ import annotations
+
+import argparse
+import http.server
+import logging
+import socketserver
+import sys
+import threading
+import time
+import webbrowser
+from pathlib import Path
+
+from screen_workflow.capture.daemon import Daemon
+from screen_workflow.storage.db import Store
+from screen_workflow.viz.report import render
+
+log = logging.getLogger(__name__)
+
+RERENDER_INTERVAL_SECONDS = 3.0
+
+
+def _rerender_loop(root: Path, out_dir: Path, stop: threading.Event) -> None:
+    while not stop.is_set():
+        try:
+            store = Store(root)
+            render(store, out_dir)
+            store.close()
+        except Exception:  # noqa: BLE001 — keep the loop alive on transient errors
+            log.exception("rerender failed")
+        stop.wait(RERENDER_INTERVAL_SECONDS)
+
+
+def _serve(out_dir: Path, port: int, stop: threading.Event) -> None:
+    """Tiny HTTP server with a meta-refresh injected so the browser auto-reloads."""
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kw):
+            super().__init__(*args, directory=str(out_dir), **kw)
+
+        def end_headers(self):
+            # Bust the browser cache so each refresh picks up the new HTML.
+            self.send_header("Cache-Control", "no-store, max-age=0")
+            super().end_headers()
+
+        def log_message(self, fmt, *args):
+            # quieter logs
+            pass
+
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer(("127.0.0.1", port), Handler) as httpd:
+        httpd.timeout = 0.5
+        while not stop.is_set():
+            httpd.handle_request()
+
+
+_LIVE_TEMPLATE_HEAD = '<meta http-equiv="refresh" content="3">'
+
+
+def _inject_auto_refresh(html_path: Path) -> None:
+    """Inject a meta-refresh tag so the page reloads every few seconds."""
+    if not html_path.exists():
+        return
+    text = html_path.read_text(encoding="utf-8")
+    if _LIVE_TEMPLATE_HEAD in text:
+        return
+    text = text.replace("<head>", f"<head>\n{_LIVE_TEMPLATE_HEAD}", 1)
+    html_path.write_text(text, encoding="utf-8")
+
+
+def _refresh_injector_loop(out_dir: Path, stop: threading.Event) -> None:
+    """Each time the renderer writes a fresh index.html (no auto-refresh tag),
+    re-inject the meta-refresh so the browser keeps reloading."""
+    while not stop.is_set():
+        _inject_auto_refresh(out_dir / "index.html")
+        stop.wait(1.0)
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="screen_workflow.live")
+    p.add_argument("--root", default="./local_data", help="capture storage dir")
+    p.add_argument("--out", default="./viz_output", help="HTML output dir")
+    p.add_argument("--port", type=int, default=8765, help="HTTP server port")
+    p.add_argument("--seconds", type=float, default=None, help="auto-stop after N seconds")
+    p.add_argument("--no-browser", action="store_true", help="don't auto-open browser")
+    p.add_argument("-v", "--verbose", action="store_true")
+    args = p.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    root = Path(args.root)
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Make sure there's at least an empty report so the browser doesn't 404.
+    store = Store(root)
+    render(store, out_dir)
+    store.close()
+    _inject_auto_refresh(out_dir / "index.html")
+
+    stop = threading.Event()
+    daemon = Daemon(root)
+
+    daemon_thread = threading.Thread(
+        target=daemon.run, kwargs={"seconds": args.seconds}, daemon=True
+    )
+    rerender_thread = threading.Thread(
+        target=_rerender_loop, args=(root, out_dir, stop), daemon=True
+    )
+    injector_thread = threading.Thread(
+        target=_refresh_injector_loop, args=(out_dir, stop), daemon=True
+    )
+    server_thread = threading.Thread(
+        target=_serve, args=(out_dir, args.port, stop), daemon=True
+    )
+    daemon_thread.start()
+    rerender_thread.start()
+    injector_thread.start()
+    server_thread.start()
+
+    url = f"http://localhost:{args.port}/"
+    print()
+    print("=" * 60)
+    print(f"  Screen-workflow live  ->  {url}")
+    print(f"  Capturing to:           {root.resolve()}")
+    print(f"  Re-rendering every:     {RERENDER_INTERVAL_SECONDS}s")
+    print("  Press Ctrl+C to stop.")
+    print("=" * 60)
+    print()
+
+    if not args.no_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+    try:
+        # The daemon thread is the source of truth for "still running".
+        while daemon_thread.is_alive():
+            daemon_thread.join(timeout=0.5)
+    except KeyboardInterrupt:
+        print("\nstopping...")
+        daemon._stop.set()  # noqa: SLF001 — internal stop signal
+    finally:
+        stop.set()
+        time.sleep(0.5)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -38,6 +38,7 @@ dev = [
 
 [project.scripts]
 screen-workflowd = "screen_workflow.capture.daemon:main"
+screen-workflow-live = "screen_workflow.live:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
