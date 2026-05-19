@@ -191,7 +191,15 @@ def render(
     }
     payload_json = json.dumps(payload, default=str)
 
-    refresh_meta = '<meta http-equiv="refresh" content="3">' if auto_refresh else ""
+    # JS-based reloader with cache-busting query param. Chrome ignores
+    # meta-refresh + no-store on localhost; ?_t=... forces a real refetch.
+    refresh_meta = (
+        '<script>setTimeout(()=>{var u=new URL(window.location.href);'
+        'u.searchParams.set("_t",Date.now());'
+        'window.location.replace(u.toString());},3000);</script>'
+        if auto_refresh
+        else ""
+    )
 
     html_out = (
         _TEMPLATE.replace("__PAYLOAD_JSON__", payload_json)
