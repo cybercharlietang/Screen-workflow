@@ -86,6 +86,9 @@ def main() -> int:
     wf = Workflow(
         workflow_id="wf_demo",
         name="PO Approval (demo)",
+        goal="Approve or reject a vendor purchase order against budget and contract terms.",
+        resources=["Outlook inbox", "vendor contract repository", "Q2 budget tracker", "SAP PO module"],
+        trigger="Vendor sends a PO approval request via email.",
         nodes={
             "read-po-email": WorkflowNode(
                 node_id="read-po-email",

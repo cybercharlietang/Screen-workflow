@@ -157,16 +157,39 @@ class WorkflowEdge(BaseModel):
 
 
 class Workflow(BaseModel):
-    """Master artifact: directed graph capturing what a workflow looks like."""
+    """Master artifact: directed graph + goal-level summary.
+
+    The graph is the evidence layer (what humans actually do, with costs).
+    The goal/resources/trigger fields are the goal-oriented summary that an
+    automating agent would consume — what to accomplish, what tools/data
+    sources to use, what initiates the workflow.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     schema_version: int = SCHEMA_VERSION
     workflow_id: str
     name: str = Field(description="Human-friendly label, e.g. 'PO Approval'")
+
+    # Goal-oriented summary (refined per call as evidence accumulates)
+    goal: str = Field(
+        default="",
+        description="One sentence: what success looks like for this workflow.",
+    )
+    resources: list[str] = Field(
+        default_factory=list,
+        description="Systems / data sources / tools the workflow touches.",
+    )
+    trigger: str = Field(
+        default="",
+        description="What initiates this workflow (event, request, schedule).",
+    )
+
+    # Evidence graph
     nodes: dict[str, WorkflowNode] = Field(default_factory=dict)
     edges: list[WorkflowEdge] = Field(default_factory=list)
     sessions_processed: list[str] = Field(default_factory=list)
+
     stable_observations: int = Field(
         ge=0,
         default=0,
@@ -177,6 +200,11 @@ class Workflow(BaseModel):
     )
     stability_threshold: int = 20
     is_complete: bool = False
+    noise_actions_count: int = Field(
+        ge=0,
+        default=0,
+        description="Cumulative count of actions Claude marked as noise.",
+    )
     created_at: datetime
     last_updated_at: datetime
 

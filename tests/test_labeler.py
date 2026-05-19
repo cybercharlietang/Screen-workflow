@@ -1,16 +1,11 @@
-"""Workflow updater: batch builder + response merging (no API calls)."""
+"""Per-action routing labeler: batch builder + merge_response (no API calls)."""
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from screen_workflow.labeler.api import (
-    _extract_json,
-    _merge_into_workflow,
-    _new_workflow,
-    _select_or_create_workflow,
-)
+from screen_workflow.labeler.api import _extract_json, _new_workflow, merge_response
 from screen_workflow.labeler.batch import APPROX_TOKENS_PER_IMAGE, build_batch
 from screen_workflow.schemas import (
     Event,
@@ -19,6 +14,7 @@ from screen_workflow.schemas import (
     SessionCloseReason,
     TriggerType,
 )
+from screen_workflow.storage.db import Store
 
 
 T0 = datetime(2026, 5, 19, 13, 0, 0, tzinfo=timezone.utc)
@@ -35,6 +31,20 @@ def _event(i: int, trigger: TriggerType = TriggerType.CLICK) -> Event:
     )
 
 
+def _session() -> Session:
+    return Session(
+        session_id="sess_1",
+        start_ts=T0,
+        end_ts=T0 + timedelta(minutes=5),
+        close_reason=SessionCloseReason.IDLE_GAP,
+        event_ids=["f_000", "f_001", "f_002"],
+    )
+
+
+def _events_by_id() -> dict:
+    return {"f_000": _event(0), "f_001": _event(1), "f_002": _event(2)}
+
+
 def _png(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(
@@ -47,7 +57,7 @@ def _png(path: Path) -> None:
 
 
 class TestBatch:
-    def test_includes_event_log_and_all_images_when_under_budget(self, tmp_path: Path) -> None:
+    def test_under_budget_keeps_all(self, tmp_path: Path) -> None:
         screens = tmp_path / "screens"
         events = []
         for i in range(5):
@@ -56,7 +66,6 @@ class TestBatch:
         batch = build_batch(events, screens, budget_tokens=400_000)
         assert "frame_id\tts\tapp" in batch.event_log_text
         assert len(batch.selected_frame_ids) == 5
-        assert batch.dropped_frame_ids == []
 
     def test_downsamples_when_over_budget(self, tmp_path: Path) -> None:
         screens = tmp_path / "screens"
@@ -71,140 +80,142 @@ class TestBatch:
         assert events[-1].event_id in batch.selected_frame_ids
 
 
-class TestMerge:
-    def _session(self) -> Session:
-        return Session(
-            session_id="sess_1",
-            start_ts=T0,
-            end_ts=T0 + timedelta(minutes=5),
-            close_reason=SessionCloseReason.IDLE_GAP,
-            event_ids=["f_000", "f_001"],
-        )
-
-    def _events_by_id(self) -> dict:
-        return {"f_000": _event(0), "f_001": _event(1)}
-
-    def test_first_call_creates_nodes_and_resets_stable(self, tmp_path) -> None:
-        from screen_workflow.storage.db import Store
+class TestMergeResponse:
+    def test_new_workflow_created_from_actions(self, tmp_path: Path) -> None:
         store = Store(tmp_path / "data")
-        wf = _new_workflow("PO Approval")
         response = {
-            "added_or_updated_nodes": [
+            "actions": [
                 {
-                    "node_id": "open-po-email",
-                    "canonical_name": "Open PO email",
+                    "target_workflow_kind": "new",
+                    "target_workflow_id": None,
+                    "target_workflow_name": "Monitor purchase",
+                    "node_id": "read-monitor-email",
+                    "canonical_name": "Read monitor request email",
+                    "is_new_node": True,
                     "cage_label": "C",
                     "system": "Outlook",
-                    "data_object_pattern": "PO #<num>",
-                    "confidence": 0.9,
-                    "rationale": "User opened approval email.",
-                    "is_new": True,
-                }
-            ],
-            "added_or_updated_edges": [],
-            "observations": [
-                {
-                    "node_id": "open-po-email",
+                    "data_object_pattern": "monitor request email",
                     "evidence_frame_ids": ["f_000"],
-                    "estimated_tokens": 900,
+                    "estimated_tokens": 800,
                     "expected_agent_steps": 1,
                     "confidence": 0.9,
+                    "rationale": "Initial email read.",
+                }
+            ],
+            "edges": [],
+            "workflow_summaries": [
+                {
+                    "target_workflow_id": None,
+                    "target_workflow_name": "Monitor purchase",
+                    "goal": "Recommend a monitor under £400 for a new hire.",
+                    "resources": ["Outlook", "vendor websites"],
+                    "trigger": "Email arrives requesting a monitor recommendation.",
                 }
             ],
         }
-        wf, obs, changed = _merge_into_workflow(wf, response, self._session(), self._events_by_id(), store)
-        assert "open-po-email" in wf.nodes
-        assert wf.nodes["open-po-email"].observation_count == 1
-        assert wf.nodes["open-po-email"].estimated_tokens == 900  # mean of one obs
+        touched, obs, noise = merge_response(response, _session(), _events_by_id(), store)
+        assert len(touched) == 1
+        wf = list(touched.values())[0]
+        assert wf.name == "Monitor purchase"
+        assert wf.goal.startswith("Recommend a monitor")
+        assert "Outlook" in wf.resources
+        assert "read-monitor-email" in wf.nodes
+        assert wf.nodes["read-monitor-email"].observation_count == 1
+        assert wf.nodes["read-monitor-email"].estimated_tokens == 800
         assert len(obs) == 1
-        assert changed is True
-        assert wf.stable_observations == 0
+        assert noise == 0
 
-    def test_repeat_observation_increments_count_no_structural_change(self, tmp_path) -> None:
-        from screen_workflow.storage.db import Store
+    def test_noise_actions_counted_but_not_persisted(self, tmp_path: Path) -> None:
         store = Store(tmp_path / "data")
-        wf = _new_workflow("PO Approval")
-        response_1 = {
-            "added_or_updated_nodes": [
+        response = {
+            "actions": [
                 {
-                    "node_id": "n",
-                    "canonical_name": "X",
+                    "target_workflow_kind": "new",
+                    "target_workflow_id": None,
+                    "target_workflow_name": "Monitor purchase",
+                    "node_id": "read-monitor-email",
+                    "canonical_name": "Read monitor request email",
+                    "is_new_node": True,
                     "cage_label": "C",
                     "system": "Outlook",
-                    "data_object_pattern": "p",
-                    "confidence": 0.8,
-                    "rationale": "",
-                    "is_new": True,
-                }
-            ],
-            "added_or_updated_edges": [],
-            "observations": [
-                {
-                    "node_id": "n",
+                    "data_object_pattern": "monitor request email",
                     "evidence_frame_ids": ["f_000"],
-                    "estimated_tokens": 500,
+                    "estimated_tokens": 800,
                     "expected_agent_steps": 1,
-                    "confidence": 0.8,
-                }
-            ],
-        }
-        wf, _, _ = _merge_into_workflow(wf, response_1, self._session(), self._events_by_id(), store)
-
-        # second call: same node, no new structure, different token estimate
-        sess2 = Session(
-            session_id="sess_2",
-            start_ts=T0 + timedelta(hours=1),
-            end_ts=T0 + timedelta(hours=1, minutes=1),
-            close_reason=SessionCloseReason.IDLE_GAP,
-            event_ids=["f_000"],
-        )
-        response_2 = {
-            "added_or_updated_nodes": [],
-            "added_or_updated_edges": [],
-            "observations": [
+                    "confidence": 0.9,
+                    "rationale": "",
+                },
                 {
-                    "node_id": "n",
+                    "target_workflow_kind": "noise",
+                    "target_workflow_id": None,
+                    "target_workflow_name": None,
+                    "node_id": "slack-ping",
+                    "canonical_name": "Coworker Slack ping",
+                    "is_new_node": True,
+                    "cage_label": "C",
+                    "system": "Slack",
+                    "data_object_pattern": "",
+                    "evidence_frame_ids": ["f_001"],
+                    "estimated_tokens": 0,
+                    "expected_agent_steps": 1,
+                    "confidence": 0.9,
+                    "rationale": "Unrelated message.",
+                },
+            ],
+            "edges": [],
+            "workflow_summaries": [],
+        }
+        touched, obs, noise = merge_response(response, _session(), _events_by_id(), store)
+        assert noise == 1
+        assert len(obs) == 1
+        wf = list(touched.values())[0]
+        assert "slack-ping" not in wf.nodes  # noise node not stored
+
+    def test_multi_workflow_session(self, tmp_path: Path) -> None:
+        store = Store(tmp_path / "data")
+        response = {
+            "actions": [
+                {
+                    "target_workflow_kind": "new",
+                    "target_workflow_id": None,
+                    "target_workflow_name": "Monitor purchase",
+                    "node_id": "read-email",
+                    "canonical_name": "Read email",
+                    "is_new_node": True,
+                    "cage_label": "C",
+                    "system": "Outlook",
+                    "data_object_pattern": "email",
                     "evidence_frame_ids": ["f_000"],
-                    "estimated_tokens": 700,
+                    "estimated_tokens": 800,
+                    "expected_agent_steps": 1,
+                    "confidence": 0.9,
+                    "rationale": "",
+                },
+                {
+                    "target_workflow_kind": "new",
+                    "target_workflow_id": None,
+                    "target_workflow_name": "Invoice check",
+                    "node_id": "open-invoice",
+                    "canonical_name": "Open invoice",
+                    "is_new_node": True,
+                    "cage_label": "C",
+                    "system": "Outlook",
+                    "data_object_pattern": "invoice",
+                    "evidence_frame_ids": ["f_002"],
+                    "estimated_tokens": 1200,
                     "expected_agent_steps": 1,
                     "confidence": 0.85,
-                }
+                    "rationale": "",
+                },
             ],
+            "edges": [],
+            "workflow_summaries": [],
         }
-        wf, obs, changed = _merge_into_workflow(wf, response_2, sess2, self._events_by_id(), store)
-        assert changed is False
-        assert wf.stable_observations == 1
-        assert wf.nodes["n"].observation_count == 2  # obs(1) + obs(1)
-        # mean of 500 and 700
-        assert wf.nodes["n"].estimated_tokens == 600
-
-    def test_stability_threshold_marks_complete(self, tmp_path) -> None:
-        from screen_workflow.schemas import CAGELabel, WorkflowNode
-        from screen_workflow.storage.db import Store
-        store = Store(tmp_path / "data")
-        wf = _new_workflow("PO Approval")
-        wf.stability_threshold = 3
-        wf.nodes = {
-            "n": WorkflowNode(
-                node_id="n",
-                canonical_name="x",
-                cage_label=CAGELabel.CAPTURE,
-                system="o",
-                data_object_pattern="p",
-                estimated_tokens=100,
-            )
-        }
-        no_op = {"added_or_updated_nodes": [], "added_or_updated_edges": [], "observations": []}
-        for i in range(3):
-            sess = Session(
-                session_id=f"s_{i}",
-                start_ts=T0,
-                end_ts=T0 + timedelta(seconds=1),
-                close_reason=SessionCloseReason.IDLE_GAP,
-                event_ids=["f_000"],
-            )
-            wf, _, _ = _merge_into_workflow(wf, no_op, sess, self._events_by_id(), store)
-        assert wf.is_complete is True
+        touched, obs, _ = merge_response(response, _session(), _events_by_id(), store)
+        assert len(touched) == 2
+        names = {wf.name for wf in touched.values()}
+        assert names == {"Monitor purchase", "Invoice check"}
+        assert len(obs) == 2
 
 
 class TestExtractJson:

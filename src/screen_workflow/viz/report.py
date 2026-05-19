@@ -74,6 +74,10 @@ def _workflow_dict(w: Workflow) -> dict:
     return {
         "workflow_id": w.workflow_id,
         "name": w.name,
+        "goal": w.goal,
+        "resources": w.resources,
+        "trigger": w.trigger,
+        "noise_actions_count": w.noise_actions_count,
         "is_complete": w.is_complete,
         "stable_observations": w.stable_observations,
         "stability_threshold": w.stability_threshold,
@@ -429,14 +433,23 @@ __AUTO_REFRESH__
       const stableBadge = w.is_complete
         ? '<span class="badge badge-ok">complete</span>'
         : `<span class="badge badge-warn">${w.stable_observations}/${w.stability_threshold} stable</span>`;
+      const resourcesHtml = (w.resources && w.resources.length)
+        ? w.resources.map(r => `<span class="badge" style="background:#e5e7eb;color:#444">${escapeHtml(r)}</span>`).join(' ')
+        : '<span style="color:#888">—</span>';
       let html = `
         <div style="background:#fff; border:1px solid #ddd; border-radius:6px; padding:16px; margin-bottom:16px">
-          <h2 style="margin:0 0 8px 0; font-size:16px">${escapeHtml(w.name)} ${stableBadge}</h2>
+          <h2 style="margin:0 0 6px 0; font-size:16px">${escapeHtml(w.name)} ${stableBadge}</h2>
+          <div style="background:#fafafa; border-left:3px solid #1f5fa7; padding:8px 12px; margin:8px 0 12px 0; font-size:13px">
+            <div><span style="color:#666; font-weight:600">Goal:</span> ${escapeHtml(w.goal || '(not yet identified)')}</div>
+            <div style="margin-top:4px"><span style="color:#666; font-weight:600">Trigger:</span> ${escapeHtml(w.trigger || '(not yet identified)')}</div>
+            <div style="margin-top:4px"><span style="color:#666; font-weight:600">Resources:</span> ${resourcesHtml}</div>
+          </div>
           <div style="font-size:12px; color:#666; margin-bottom:12px">
             ${w.nodes.length} nodes · ${w.edges.length} edges · sessions: ${w.sessions_processed.length}
+            ${w.noise_actions_count > 0 ? ` · noise dropped: ${w.noise_actions_count}` : ''}
           </div>
           <table style="margin-bottom:8px">
-            <thead><tr><th>Node</th><th>CAGE</th><th>System</th><th>Data object</th><th class="num">Tokens</th><th class="num">Steps</th><th class="num">Seen</th><th>Why</th></tr></thead>
+            <thead><tr><th>Node</th><th>CAGE</th><th>System</th><th>Data object</th><th class="num">Tokens (mean)</th><th class="num">Steps</th><th class="num">Seen</th><th>Why</th></tr></thead>
             <tbody>`;
       w.nodes.forEach(n => {
         html += `

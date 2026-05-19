@@ -8,14 +8,14 @@ observation_count. See SPEC.md when this gets revisited.
 from screen_workflow.labeler.api import (
     LabelerError,
     process_all_unprocessed_sessions,
-    update_with_session,
+    process_session,
 )
 from screen_workflow.labeler.batch import Batch, build_batch
 
 __all__ = [
     "Batch",
     "build_batch",
-    "update_with_session",
+    "process_session",
     "process_all_unprocessed_sessions",
     "LabelerError",
 ]
