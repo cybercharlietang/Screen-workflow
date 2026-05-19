@@ -89,9 +89,11 @@ def test_render_produces_self_contained_html(tmp_path: Path) -> None:
 
     assert out.name == "index.html"
     assert "<!doctype html>" in contents
-    assert "data:image/jpeg;base64," in contents  # thumbnails are JPEG now
-    assert "Demo" in contents              # workflow name in payload
-    assert "Open thing" in contents        # node name
+    # Data is now in a sibling data.json file fetched by JS.
+    data_json = (tmp_path / "viz" / "data.json").read_text(encoding="utf-8")
+    assert "data:image/jpeg;base64," in data_json
+    assert "Demo" in data_json
+    assert "Open thing" in data_json
 
 
 _TINY_PNG = bytes.fromhex(

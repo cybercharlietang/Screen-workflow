@@ -225,23 +225,16 @@ def render(
     }
     payload_json = json.dumps(payload, default=str)
 
-    # JS-based reloader with cache-busting query param. Chrome ignores
-    # meta-refresh + no-store on localhost; ?_t=... forces a real refetch.
-    refresh_meta = (
-        '<script>setTimeout(()=>{var u=new URL(window.location.href);'
-        'u.searchParams.set("_t",Date.now());'
-        'window.location.replace(u.toString());},3000);</script>'
-        if auto_refresh
-        else ""
-    )
+    # Always write data.json so the page can poll it without a full reload.
+    (out_dir / "data.json").write_text(payload_json, encoding="utf-8")
 
+    # The page itself is small and stable; the JS fetches data.json on a
+    # timer and updates the DOM in place. Tabs persist, no flicker, no
+    # cache-bust hacks.
     html_out = (
-        _TEMPLATE.replace("__PAYLOAD_JSON__", payload_json)
-        .replace(
-            "__TITLE__",
-            html.escape(f"Screen-workflow report — {session_id or 'all sessions'}"),
-        )
-        .replace("__AUTO_REFRESH__", refresh_meta)
+        _TEMPLATE.replace("__TITLE__",
+            html.escape(f"Screen-workflow report — {session_id or 'all sessions'}"))
+        .replace("__AUTO_REFRESH__", "")
     )
 
     out_path = out_dir / "index.html"
@@ -350,10 +343,56 @@ __AUTO_REFRESH__
     <div id="cost-content"></div>
   </section>
 </main>
-<script id="payload" type="application/json">__PAYLOAD_JSON__</script>
 <script>
+const POLL_INTERVAL_MS = 3000;
+let currentData = null;
+
+async function fetchData() {
+  try {
+    const r = await fetch('data.json?_t=' + Date.now(), { cache: 'no-store' });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) {
+    console.warn('fetch failed', e);
+    return null;
+  }
+}
+
+function renderAll(data) {
+  currentData = data;
+  render(data);
+}
+
 (function () {
-  const data = JSON.parse(document.getElementById('payload').textContent);
+  // Set up tabs ONCE (before any data — they work regardless).
+  function activateTab(name) {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('section').forEach(s => s.classList.remove('active'));
+    const btn = document.querySelector('.tab-btn[data-tab="' + name + '"]');
+    const sec = document.getElementById(name);
+    if (btn && sec) { btn.classList.add('active'); sec.classList.add('active'); }
+  }
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const t = btn.dataset.tab;
+      window.location.hash = '#' + t;
+      activateTab(t);
+    });
+  });
+  activateTab((window.location.hash || '#events').slice(1));
+
+  // Kick off polling.
+  (async () => {
+    const data = await fetchData();
+    if (data) renderAll(data);
+    setInterval(async () => {
+      const newData = await fetchData();
+      if (newData) renderAll(newData);
+    }, POLL_INTERVAL_MS);
+  })();
+})();
+
+function render(data) {
   const totalInDb = data.events_total_in_db || data.events.length;
   const eventsCountMsg = (totalInDb > data.events.length)
     ? `${data.events.length} of ${totalInDb} events shown (most recent)`
@@ -407,27 +446,13 @@ __AUTO_REFRESH__
     }
   })();
 
-  // Tabs — persist selection in URL hash so meta-refresh doesn't reset it.
-  function activateTab(name) {
-    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-    document.querySelectorAll('section').forEach(s => s.classList.remove('active'));
-    const btn = document.querySelector('.tab-btn[data-tab="' + name + '"]');
-    const sec = document.getElementById(name);
-    if (btn && sec) {
-      btn.classList.add('active');
-      sec.classList.add('active');
-    }
-  }
-  document.querySelectorAll('.tab-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const t = btn.dataset.tab;
-      window.location.hash = '#' + t;
-      activateTab(t);
-    });
+  // Clear all dynamic regions so repeated polls don't accumulate duplicates.
+  ['events-tbody','sessions-tbody','observations-tbody',
+   'workflows-content','pipeline-content','cost-content','event-detail'
+  ].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = '';
   });
-  // Restore from hash on load
-  const initial = (window.location.hash || '#events').slice(1);
-  activateTab(initial);
 
   // Events
   const tbody = document.getElementById('events-tbody');
@@ -583,19 +608,22 @@ __AUTO_REFRESH__
       if (a) {
         const sum = a.summary || {};
         const wfs = sum.workflows_touched || [];
-        const cr = a.claude_response || {};
-        const actions = cr.actions || [];
+        // Aggregate actions across all chunks
+        const chunks = a.chunks || (a.claude_response ? [{claude_response: a.claude_response}] : []);
+        const actions = chunks.flatMap(c => (c.claude_response && c.claude_response.actions) || []);
         const nonNoise = actions.filter(x => (x.target_workflow_kind || '').toLowerCase() !== 'noise');
         const noiseActs = actions.filter(x => (x.target_workflow_kind || '').toLowerCase() === 'noise');
+        const totalImages = chunks.reduce((s,c) => s + ((c.batch && c.batch.selected_frame_ids) || []).length, 0);
+        const cr = {actions, chunks_count: chunks.length};
         inner += `
           <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:8px; font-size:12px; margin-bottom:10px">
             <div style="background:#f4f4f4; padding:6px 10px; border-radius:4px">
-              <div style="color:#666">Batch frames</div>
-              <div style="font-weight:600">${(a.batch.selected_frame_ids || []).length} selected / ${(a.batch.dropped_frame_ids || []).length} dropped</div>
+              <div style="color:#666">Chunks / images</div>
+              <div style="font-weight:600">${chunks.length} call(s) / ${totalImages} frames</div>
             </div>
             <div style="background:#f4f4f4; padding:6px 10px; border-radius:4px">
-              <div style="color:#666">Input tokens (est)</div>
-              <div style="font-weight:600">${(a.batch.approx_input_tokens || 0).toLocaleString()}</div>
+              <div style="color:#666">Total tokens (Claude)</div>
+              <div style="font-weight:600">${((sum.total_input_tokens||0) + (sum.total_output_tokens||0)).toLocaleString()}</div>
             </div>
             <div style="background:#f4f4f4; padding:6px 10px; border-radius:4px">
               <div style="color:#666">Workflows touched</div>
@@ -669,7 +697,7 @@ __AUTO_REFRESH__
       '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
     })[c]);
   }
-})();
+}
 </script>
 </body>
 </html>

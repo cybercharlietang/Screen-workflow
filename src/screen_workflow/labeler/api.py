@@ -243,30 +243,29 @@ def _write_audit(
     root: Path,
     *,
     session: Session,
-    batch,
-    response: dict,
+    chunk_audits: list[dict],
     touched_workflows: dict,
     observations: list,
     noise_count: int,
     model: str,
-    usage,
-    n_chunks: int = 1,
 ) -> None:
-    """Persist what Claude returned for this session, for the Pipeline view."""
+    """Persist what Claude returned across all chunks for this session.
+
+    Saved at ``local_data/audit/<session_id>.json`` with one entry per chunk
+    plus a session-level summary. Lets you see exactly what Claude saw and
+    said for each API call.
+    """
     try:
         audit_dir = root / "audit"
         audit_dir.mkdir(parents=True, exist_ok=True)
+        total_input = sum(c.get("input_tokens") or 0 for c in chunk_audits)
+        total_output = sum(c.get("output_tokens") or 0 for c in chunk_audits)
         payload = {
             "session_id": session.session_id,
             "ts": datetime.now(timezone.utc).isoformat(),
             "model": model,
-            "n_chunks": n_chunks,
-            "batch": {
-                "selected_frame_ids": batch.selected_frame_ids if batch else [],
-                "dropped_frame_ids": batch.dropped_frame_ids if batch else [],
-                "approx_input_tokens": batch.approx_input_tokens if batch else 0,
-            },
-            "claude_response": response,
+            "n_chunks": len(chunk_audits),
+            "chunks": chunk_audits,
             "summary": {
                 "workflows_touched": [
                     {"workflow_id": wf.workflow_id, "name": wf.name}
@@ -274,8 +273,8 @@ def _write_audit(
                 ],
                 "observations_inserted": len(observations),
                 "noise_actions_count": noise_count,
-                "output_tokens": getattr(usage, "output_tokens", None),
-                "input_tokens": getattr(usage, "input_tokens", None),
+                "total_input_tokens": total_input,
+                "total_output_tokens": total_output,
             },
         }
         (audit_dir / f"{session.session_id}.json").write_text(
@@ -577,9 +576,7 @@ def process_session(
     all_touched: dict[str, Workflow] = {}
     all_observations: list[Observation] = []
     total_noise = 0
-    last_response = None
-    last_batch = None
-    last_usage = None
+    chunk_audits: list[dict] = []
 
     for i, batch in enumerate(batches, start=1):
         # Re-read the directory each chunk so Claude sees the workflow state
@@ -616,21 +613,28 @@ def process_session(
             all_touched[wf.workflow_id] = wf
         all_observations.extend(observations)
         total_noise += noise_count
-        last_response, last_batch, last_usage = response, batch, getattr(resp, "usage", None)
+        chunk_audits.append({
+            "chunk_index": i,
+            "n_chunks": len(batches),
+            "batch": {
+                "selected_frame_ids": batch.selected_frame_ids,
+                "approx_input_tokens": batch.approx_input_tokens,
+            },
+            "claude_response": response,
+            "output_tokens": getattr(resp.usage, "output_tokens", None),
+            "input_tokens": getattr(resp.usage, "input_tokens", None),
+        })
 
-    # Audit log: persist what happened across all chunks for this session.
-    if last_response is not None:
+    # Audit log: persist what happened across ALL chunks for this session.
+    if chunk_audits:
         _write_audit(
             store.root,
             session=session,
-            batch=last_batch,
-            response=last_response,
+            chunk_audits=chunk_audits,
             touched_workflows=all_touched,
             observations=all_observations,
             noise_count=total_noise,
             model=model,
-            usage=last_usage,
-            n_chunks=len(batches),
         )
     touched = all_touched
     observations = all_observations
