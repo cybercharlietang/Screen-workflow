@@ -2,22 +2,24 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from pydantic import ValidationError
 
 from screen_workflow.schemas import (
     SCHEMA_VERSION,
-    ActionUnit,
     CAGELabel,
     Event,
     InputEvent,
-    Label,
+    Observation,
     Session,
     SessionCloseReason,
     TriggerType,
     UIElement,
+    Workflow,
+    WorkflowEdge,
+    WorkflowNode,
 )
 
 
@@ -99,55 +101,51 @@ class TestSession:
             )
 
 
-class TestLabel:
-    def _make_label(self, **overrides) -> Label:
-        defaults = dict(
-            action_id="act-1",
-            session_id="sess-1",
-            cage_label=CAGELabel.ANALYZE,
-            system="SAP",
-            data_object="PO #12345",
-            estimated_tokens=4500,
-            start_ts=T0,
-            end_ts=T0 + timedelta(seconds=45),
-            evidence_frame_ids=["01H_AAA"],
-            confidence=0.82,
-            rationale="User reconciled line items against the PO.",
+class TestWorkflow:
+    def test_empty_workflow_constructs(self) -> None:
+        now = datetime.now(timezone.utc)
+        w = Workflow(
+            workflow_id="wf_1",
+            name="PO Approval",
+            created_at=now,
+            last_updated_at=now,
         )
-        defaults.update(overrides)
-        return Label(**defaults)
+        assert w.nodes == {}
+        assert w.edges == []
+        assert w.is_complete is False
+        assert w.stability_threshold == 20
 
-    def test_constructs(self) -> None:
-        assert self._make_label().cage_label is CAGELabel.ANALYZE
-
-    @pytest.mark.parametrize("bad", [-0.01, 1.01, 2.0])
-    def test_confidence_bounded(self, bad: float) -> None:
-        with pytest.raises(ValidationError):
-            self._make_label(confidence=bad)
-
-    def test_rejects_inverted_timestamps(self) -> None:
-        with pytest.raises(ValidationError):
-            self._make_label(start_ts=T0 + timedelta(seconds=10), end_ts=T0)
-
-    def test_rejects_empty_evidence(self) -> None:
-        with pytest.raises(ValidationError):
-            self._make_label(evidence_frame_ids=[])
-
-
-class TestActionUnit:
-    def test_constructs(self) -> None:
-        u = ActionUnit(
-            action_id="act-1",
-            start_frame_id="01H_AAA",
-            end_frame_id="01H_BBB",
-            description="Open PO #12345 in SAP",
+    def test_node_validation(self) -> None:
+        n = WorkflowNode(
+            node_id="open-po-email",
+            canonical_name="Open PO email",
+            cage_label=CAGELabel.CAPTURE,
+            system="Outlook",
+            data_object_pattern="PO #<num>",
+            estimated_tokens=1200,
         )
-        assert u.target_data_hint is None
+        assert n.cage_label is CAGELabel.CAPTURE
+        assert n.expected_agent_steps == 1
+        assert n.observation_count == 0
+
+
+class TestObservation:
+    def test_requires_evidence(self) -> None:
+        with pytest.raises(ValidationError):
+            Observation(
+                observation_id="o1",
+                workflow_id="wf1",
+                session_id="s1",
+                node_id="n1",
+                evidence_frame_ids=[],
+                confidence=0.9,
+                observed_at=T0,
+            )
 
 
 class TestSchemaVersionStable:
     """If this test fails, you've intentionally introduced a breaking change.
     Update SPEC.md § 4 in the same commit and bump SCHEMA_VERSION."""
 
-    def test_schema_version_is_one(self) -> None:
-        assert SCHEMA_VERSION == 1
+    def test_schema_version_is_two(self) -> None:
+        assert SCHEMA_VERSION == 2

@@ -1,20 +1,21 @@
-"""Batch builder + single-pass Claude labeler (PoC).
+"""Per-workflow labeler: incremental updates to a workflow graph (PoC).
 
-Two-pass is SPEC § 4.4's design; single-pass is the PoC simplification.
-See LESSONS.md when this gets revisited.
+Each Claude call ingests one session and updates the named workflow.
+Repeated actions across sessions collapse into one node with an
+observation_count. See SPEC.md when this gets revisited.
 """
 
 from screen_workflow.labeler.api import (
-    label_all_unlabeled,
-    label_session,
     LabelerError,
+    process_all_unprocessed_sessions,
+    update_workflow_with_session,
 )
 from screen_workflow.labeler.batch import Batch, build_batch
 
 __all__ = [
     "Batch",
     "build_batch",
-    "label_session",
-    "label_all_unlabeled",
+    "update_workflow_with_session",
+    "process_all_unprocessed_sessions",
     "LabelerError",
 ]

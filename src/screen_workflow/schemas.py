@@ -11,11 +11,10 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +112,7 @@ class Session(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Label (Phase 4 output)
+# Workflow graph (primary artifact)
 # ---------------------------------------------------------------------------
 
 
@@ -124,54 +123,73 @@ class CAGELabel(str, Enum):
     EXTRACT = "E"
 
 
-class ActionUnit(BaseModel):
-    """Pass A output: a segmented action before classification."""
+class WorkflowNode(BaseModel):
+    """One unique abstract action — repeated instances collapse to this node."""
 
     model_config = ConfigDict(extra="forbid")
 
-    action_id: str
-    start_frame_id: str
-    end_frame_id: str
-    description: str = Field(description="One-line summary from Pass A")
-    target_data_hint: str | None = None
+    node_id: str = Field(description="Stable id, kebab-cased canonical_name")
+    canonical_name: str = Field(description="Short human-friendly action name")
+    cage_label: CAGELabel
+    system: str = Field(description="App/system the action happens in")
+    data_object_pattern: str = Field(
+        description=(
+            "Generic, not instance-specific. 'PO #<num>' rather than 'PO #12345'."
+        )
+    )
+    estimated_tokens: int = Field(ge=0, description="Input+output of one LLM call")
+    expected_agent_steps: int = Field(
+        ge=1, default=1, description="LLM calls a real agent would make"
+    )
+    observation_count: int = Field(ge=0, default=0)
+    confidence: float = Field(ge=0.0, le=1.0, default=0.5)
+    rationale: str = ""
 
 
-class Label(BaseModel):
-    """Pass B output: a classified action."""
+class WorkflowEdge(BaseModel):
+    """Observed transition: after ``from_node`` we saw ``to_node`` happen."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    from_node: str
+    to_node: str
+    observation_count: int = Field(ge=0, default=0)
+
+
+class Workflow(BaseModel):
+    """Master artifact: directed graph capturing what a workflow looks like."""
 
     model_config = ConfigDict(extra="forbid")
 
     schema_version: int = SCHEMA_VERSION
-    action_id: str
-    session_id: str
-    cage_label: CAGELabel
-    system: str
-    data_object: str
-    estimated_tokens: int = Field(
+    workflow_id: str
+    name: str = Field(description="Human-friendly label, e.g. 'PO Approval'")
+    nodes: dict[str, WorkflowNode] = Field(default_factory=dict)
+    edges: list[WorkflowEdge] = Field(default_factory=list)
+    sessions_processed: list[str] = Field(default_factory=list)
+    stable_observations: int = Field(
         ge=0,
+        default=0,
         description=(
-            "Claude's estimate of tokens an agent would consume in a single "
-            "LLM call to perform this action (input + output combined). "
-            "Multiply by expected_agent_steps for a multi-step estimate."
+            "Consecutive update calls that added no new node or edge. Once "
+            "this hits ``stability_threshold`` the workflow is marked complete."
         ),
     )
-    expected_agent_steps: int = Field(
-        ge=1,
-        default=1,
-        description=(
-            "How many sequential LLM calls a real agent would likely make to "
-            "complete this action (e.g. read context, decide, write output). "
-            "Total cost ≈ estimated_tokens × expected_agent_steps."
-        ),
-    )
-    start_ts: datetime
-    end_ts: datetime
-    evidence_frame_ids: list[str] = Field(min_length=1)
-    confidence: Annotated[float, Field(ge=0.0, le=1.0)]
-    rationale: str
+    stability_threshold: int = 20
+    is_complete: bool = False
+    created_at: datetime
+    last_updated_at: datetime
 
-    @model_validator(mode="after")
-    def _check_ordered(self) -> "Label":
-        if self.end_ts < self.start_ts:
-            raise ValueError("end_ts must be >= start_ts")
-        return self
+
+class Observation(BaseModel):
+    """Records that frames in a session mapped to a workflow node."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    observation_id: str
+    workflow_id: str
+    session_id: str
+    node_id: str
+    evidence_frame_ids: list[str] = Field(min_length=1)
+    confidence: float = Field(ge=0.0, le=1.0)
+    observed_at: datetime

@@ -6,9 +6,7 @@ for the deferred SQLCipher work.
 Layout::
 
     <root>/
-      events.db          -- SQLite, one row per Event
-      sessions.db        -- (same file in practice; separate table)
-      labels.db          -- (same file; separate table)
+      events.db          -- SQLite, one row per Event / Session / Workflow / Observation
       screens/
         YYYY/MM/DD/<event_id>.png
 """
@@ -23,14 +21,14 @@ from pathlib import Path
 from typing import Iterator
 
 from screen_workflow.schemas import (
-    CAGELabel,
     Event,
     InputEvent,
-    Label,
+    Observation,
     Session,
     SessionCloseReason,
     TriggerType,
     UIElement,
+    Workflow,
 )
 
 _DDL = """
@@ -57,21 +55,26 @@ CREATE TABLE IF NOT EXISTS sessions (
     close_reason TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS labels (
-    action_id            TEXT PRIMARY KEY,
-    session_id           TEXT NOT NULL,
-    cage_label           TEXT NOT NULL,
-    system               TEXT NOT NULL,
-    data_object          TEXT NOT NULL,
-    estimated_tokens     INTEGER NOT NULL,
-    expected_agent_steps INTEGER NOT NULL DEFAULT 1,
-    start_ts             TEXT NOT NULL,
-    end_ts               TEXT NOT NULL,
-    evidence_frame_ids   TEXT NOT NULL,
-    confidence           REAL NOT NULL,
-    rationale            TEXT NOT NULL
+CREATE TABLE IF NOT EXISTS workflows (
+    workflow_id      TEXT PRIMARY KEY,
+    name             TEXT NOT NULL,
+    json_blob        TEXT NOT NULL,
+    is_complete      INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL,
+    last_updated_at  TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_labels_session ON labels(session_id);
+
+CREATE TABLE IF NOT EXISTS observations (
+    observation_id     TEXT PRIMARY KEY,
+    workflow_id        TEXT NOT NULL,
+    session_id         TEXT NOT NULL,
+    node_id            TEXT NOT NULL,
+    evidence_frame_ids TEXT NOT NULL,
+    confidence         REAL NOT NULL,
+    observed_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_obs_workflow ON observations(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_obs_session ON observations(session_id);
 """
 
 
@@ -84,11 +87,9 @@ class Store:
         self.screens_dir = self.root / "screens"
         self.screens_dir.mkdir(exist_ok=True)
         self.db_path = self.root / "events.db"
-        # check_same_thread=False: the daemon writes from its worker thread
-        # while live-mode's renderer reads from a separate thread. Python's
-        # sqlite3 module serializes operations on a single connection via a
-        # per-connection mutex, so cross-thread use is safe here.
-        # WAL journal mode lets readers continue while a writer holds a lock.
+        # check_same_thread=False so the daemon worker thread can write while
+        # the live-mode renderer reads. Python's sqlite3 serializes ops on a
+        # single connection internally. WAL allows readers during writes.
         self._conn = sqlite3.connect(
             self.db_path, isolation_level=None, check_same_thread=False
         )
@@ -164,50 +165,85 @@ class Store:
                 event_ids=event_ids,
             )
 
-    # -- labels ------------------------------------------------------------
+    # -- workflows ---------------------------------------------------------
 
-    def insert_label(self, label: Label) -> None:
+    def upsert_workflow(self, workflow: Workflow) -> None:
         self._conn.execute(
-            "INSERT OR REPLACE INTO labels VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO workflows VALUES (?,?,?,?,?,?)",
             (
-                label.action_id,
-                label.session_id,
-                label.cage_label.value,
-                label.system,
-                label.data_object,
-                label.estimated_tokens,
-                label.expected_agent_steps,
-                label.start_ts.isoformat(),
-                label.end_ts.isoformat(),
-                json.dumps(label.evidence_frame_ids),
-                label.confidence,
-                label.rationale,
+                workflow.workflow_id,
+                workflow.name,
+                workflow.model_dump_json(),
+                int(workflow.is_complete),
+                workflow.created_at.isoformat(),
+                workflow.last_updated_at.isoformat(),
             ),
         )
 
-    def iter_labels(self, session_id: str | None = None) -> Iterator[Label]:
-        if session_id is None:
-            cur = self._conn.execute("SELECT * FROM labels ORDER BY start_ts")
-        else:
-            cur = self._conn.execute(
-                "SELECT * FROM labels WHERE session_id = ? ORDER BY start_ts",
-                (session_id,),
-            )
+    def get_workflow(self, workflow_id: str) -> Workflow | None:
+        row = self._conn.execute(
+            "SELECT json_blob FROM workflows WHERE workflow_id = ?",
+            (workflow_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return Workflow.model_validate_json(row[0])
+
+    def find_workflow_by_name(self, name: str) -> Workflow | None:
+        row = self._conn.execute(
+            "SELECT json_blob FROM workflows WHERE name = ? LIMIT 1",
+            (name,),
+        ).fetchone()
+        if row is None:
+            return None
+        return Workflow.model_validate_json(row[0])
+
+    def iter_workflows(self) -> Iterator[Workflow]:
+        for row in self._conn.execute("SELECT json_blob FROM workflows ORDER BY name"):
+            yield Workflow.model_validate_json(row[0])
+
+    # -- observations ------------------------------------------------------
+
+    def insert_observation(self, obs: Observation) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO observations VALUES (?,?,?,?,?,?,?)",
+            (
+                obs.observation_id,
+                obs.workflow_id,
+                obs.session_id,
+                obs.node_id,
+                json.dumps(obs.evidence_frame_ids),
+                obs.confidence,
+                obs.observed_at.isoformat(),
+            ),
+        )
+
+    def iter_observations(
+        self,
+        workflow_id: str | None = None,
+        session_id: str | None = None,
+    ) -> Iterator[Observation]:
+        clauses, params = [], []
+        if workflow_id is not None:
+            clauses.append("workflow_id = ?"); params.append(workflow_id)
+        if session_id is not None:
+            clauses.append("session_id = ?"); params.append(session_id)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        cur = self._conn.execute(
+            f"SELECT * FROM observations{where} ORDER BY observed_at", params
+        )
         for row in cur:
-            yield Label(
-                action_id=row[0],
-                session_id=row[1],
-                cage_label=CAGELabel(row[2]),
-                system=row[3],
-                data_object=row[4],
-                estimated_tokens=row[5],
-                expected_agent_steps=row[6],
-                start_ts=datetime.fromisoformat(row[7]),
-                end_ts=datetime.fromisoformat(row[8]),
-                evidence_frame_ids=json.loads(row[9]),
-                confidence=row[10],
-                rationale=row[11],
+            yield Observation(
+                observation_id=row[0],
+                workflow_id=row[1],
+                session_id=row[2],
+                node_id=row[3],
+                evidence_frame_ids=json.loads(row[4]),
+                confidence=row[5],
+                observed_at=datetime.fromisoformat(row[6]),
             )
+
+    # -- lifecycle ---------------------------------------------------------
 
     def close(self) -> None:
         self._conn.close()

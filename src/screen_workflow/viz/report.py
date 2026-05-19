@@ -13,7 +13,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from screen_workflow.schemas import Event, Label, Session
+from screen_workflow.schemas import Event, Observation, Session, Workflow
 from screen_workflow.storage.db import Store
 
 
@@ -54,19 +54,55 @@ def _session_dict(s: Session) -> dict:
     }
 
 
-def _label_dict(l: Label) -> dict:
+def _observation_dict(o: Observation, node_lookup: dict[str, dict]) -> dict:
+    node = node_lookup.get(o.node_id, {})
     return {
-        "action_id": l.action_id,
-        "session_id": l.session_id,
-        "cage_label": l.cage_label.value,
-        "system": l.system,
-        "data_object": l.data_object,
-        "estimated_tokens": l.estimated_tokens,
-        "start_ts": _ts(l.start_ts),
-        "end_ts": _ts(l.end_ts),
-        "evidence_frame_ids": l.evidence_frame_ids,
-        "confidence": l.confidence,
-        "rationale": l.rationale,
+        "observation_id": o.observation_id,
+        "workflow_id": o.workflow_id,
+        "session_id": o.session_id,
+        "node_id": o.node_id,
+        "node_name": node.get("canonical_name", o.node_id),
+        "cage_label": node.get("cage_label", "?"),
+        "system": node.get("system", ""),
+        "evidence_frame_ids": o.evidence_frame_ids,
+        "confidence": o.confidence,
+        "observed_at": _ts(o.observed_at),
+    }
+
+
+def _workflow_dict(w: Workflow) -> dict:
+    return {
+        "workflow_id": w.workflow_id,
+        "name": w.name,
+        "is_complete": w.is_complete,
+        "stable_observations": w.stable_observations,
+        "stability_threshold": w.stability_threshold,
+        "sessions_processed": w.sessions_processed,
+        "nodes": [
+            {
+                "node_id": n.node_id,
+                "canonical_name": n.canonical_name,
+                "cage_label": n.cage_label.value,
+                "system": n.system,
+                "data_object_pattern": n.data_object_pattern,
+                "estimated_tokens": n.estimated_tokens,
+                "expected_agent_steps": n.expected_agent_steps,
+                "observation_count": n.observation_count,
+                "confidence": n.confidence,
+                "rationale": n.rationale,
+            }
+            for n in w.nodes.values()
+        ],
+        "edges": [
+            {
+                "from_node": e.from_node,
+                "to_node": e.to_node,
+                "observation_count": e.observation_count,
+            }
+            for e in w.edges
+        ],
+        "created_at": _ts(w.created_at),
+        "last_updated_at": _ts(w.last_updated_at),
     }
 
 
@@ -93,20 +129,44 @@ def render(
     out_dir.mkdir(parents=True, exist_ok=True)
     events = [_event_dict(e, store.screens_dir) for e in store.iter_events(session_id)]
     sessions = [_session_dict(s) for s in store.iter_sessions()]
-    labels = [_label_dict(l) for l in store.iter_labels(session_id)]
+    workflows = [_workflow_dict(w) for w in store.iter_workflows()]
+    node_lookup = {
+        n["node_id"]: n for w in workflows for n in w["nodes"]
+    }
+    observations = [
+        _observation_dict(o, node_lookup) for o in store.iter_observations(session_id=session_id)
+    ]
 
-    cost_summary: dict[str, dict[str, float]] = {}
-    for l in labels:
-        bucket = cost_summary.setdefault(l["cage_label"], {"count": 0, "tokens": 0})
-        bucket["count"] += 1
-        bucket["tokens"] += l["estimated_tokens"]
+    # Per-workflow cost rollup: agent cost to replace one execution of the workflow
+    # ≈ sum over nodes of estimated_tokens × expected_agent_steps
+    cost_summary = []
+    for wf in workflows:
+        nodes = wf["nodes"]
+        per_execution = sum(n["estimated_tokens"] * n["expected_agent_steps"] for n in nodes)
+        cage_breakdown: dict[str, int] = {}
+        for n in nodes:
+            cage_breakdown[n["cage_label"]] = (
+                cage_breakdown.get(n["cage_label"], 0)
+                + n["estimated_tokens"] * n["expected_agent_steps"]
+            )
+        cost_summary.append(
+            {
+                "workflow_id": wf["workflow_id"],
+                "name": wf["name"],
+                "is_complete": wf["is_complete"],
+                "node_count": len(nodes),
+                "per_execution_tokens": per_execution,
+                "cage_breakdown": cage_breakdown,
+            }
+        )
 
     payload = {
         "generated_at": _ts(datetime.now()),
         "session_filter": session_id,
         "events": events,
         "sessions": sessions,
-        "labels": labels,
+        "workflows": workflows,
+        "observations": observations,
         "cost_summary": cost_summary,
         "daemon_status": _read_status(store.root),
     }
@@ -194,7 +254,8 @@ __AUTO_REFRESH__
 <nav>
   <button class="tab-btn active" data-tab="events">Events</button>
   <button class="tab-btn" data-tab="sessions">Sessions</button>
-  <button class="tab-btn" data-tab="labels">Labels</button>
+  <button class="tab-btn" data-tab="workflows">Workflows</button>
+  <button class="tab-btn" data-tab="observations">Observations</button>
   <button class="tab-btn" data-tab="cost">Cost</button>
 </nav>
 <main>
@@ -211,18 +272,17 @@ __AUTO_REFRESH__
       <tbody id="sessions-tbody"></tbody>
     </table>
   </section>
-  <section id="labels">
+  <section id="workflows">
+    <div id="workflows-content"></div>
+  </section>
+  <section id="observations">
     <table>
-      <thead><tr><th>Action</th><th>CAGE</th><th>System</th><th>Data object</th><th class="num">Tokens</th><th class="num">Conf.</th><th>Rationale</th></tr></thead>
-      <tbody id="labels-tbody"></tbody>
+      <thead><tr><th>Time</th><th>Workflow Node</th><th>CAGE</th><th>System</th><th>Session</th><th class="num">Conf.</th><th>Frames</th></tr></thead>
+      <tbody id="observations-tbody"></tbody>
     </table>
   </section>
   <section id="cost">
-    <table>
-      <thead><tr><th>CAGE</th><th class="num">Action count</th><th class="num">Total tokens (est.)</th><th class="num">Avg / action</th></tr></thead>
-      <tbody id="cost-tbody"></tbody>
-    </table>
-    <p class="empty" id="cost-empty">Cost rows fill in once labels are present.</p>
+    <div id="cost-content"></div>
   </section>
 </main>
 <script id="payload" type="application/json">__PAYLOAD_JSON__</script>
@@ -348,41 +408,95 @@ __AUTO_REFRESH__
   });
   if (data.sessions.length === 0) stb.innerHTML = '<tr><td colspan="5" class="empty">No sessions yet.</td></tr>';
 
-  // Labels
-  const ltb = document.getElementById('labels-tbody');
-  data.labels.forEach(l => {
-    ltb.innerHTML += `
+  // Workflows
+  const wfc = document.getElementById('workflows-content');
+  if (!data.workflows || data.workflows.length === 0) {
+    wfc.innerHTML = '<p class="empty">No workflows yet. Run <code>screen-workflow-label --workflow &lt;name&gt;</code> to start one.</p>';
+  } else {
+    data.workflows.forEach(w => {
+      const stableBadge = w.is_complete
+        ? '<span class="badge badge-ok">complete</span>'
+        : `<span class="badge badge-warn">${w.stable_observations}/${w.stability_threshold} stable</span>`;
+      let html = `
+        <div style="background:#fff; border:1px solid #ddd; border-radius:6px; padding:16px; margin-bottom:16px">
+          <h2 style="margin:0 0 8px 0; font-size:16px">${escapeHtml(w.name)} ${stableBadge}</h2>
+          <div style="font-size:12px; color:#666; margin-bottom:12px">
+            ${w.nodes.length} nodes · ${w.edges.length} edges · sessions: ${w.sessions_processed.length}
+          </div>
+          <table style="margin-bottom:8px">
+            <thead><tr><th>Node</th><th>CAGE</th><th>System</th><th>Data object</th><th class="num">Tokens</th><th class="num">Steps</th><th class="num">Seen</th><th>Why</th></tr></thead>
+            <tbody>`;
+      w.nodes.forEach(n => {
+        html += `
+          <tr>
+            <td>${escapeHtml(n.canonical_name)}</td>
+            <td><span class="pill pill-${n.cage_label}">${n.cage_label}</span></td>
+            <td>${escapeHtml(n.system)}</td>
+            <td>${escapeHtml(n.data_object_pattern)}</td>
+            <td class="num">${n.estimated_tokens.toLocaleString()}</td>
+            <td class="num">${n.expected_agent_steps}</td>
+            <td class="num">${n.observation_count}</td>
+            <td style="font-size:12px; color:#555">${escapeHtml(n.rationale)}</td>
+          </tr>`;
+      });
+      html += `
+            </tbody>
+          </table>`;
+      if (w.edges.length > 0) {
+        html += `<details><summary style="cursor:pointer; font-size:12px; color:#666">Transitions (${w.edges.length})</summary><div style="margin-top:8px; font-size:12px">`;
+        w.edges.forEach(e => {
+          html += `<div>${escapeHtml(e.from_node)} → ${escapeHtml(e.to_node)} <span style="color:#888">×${e.observation_count}</span></div>`;
+        });
+        html += `</div></details>`;
+      }
+      html += `</div>`;
+      wfc.innerHTML += html;
+    });
+  }
+
+  // Observations
+  const otb = document.getElementById('observations-tbody');
+  data.observations.forEach(o => {
+    otb.innerHTML += `
       <tr>
-        <td>${escapeHtml(l.action_id)}</td>
-        <td><span class="pill pill-${l.cage_label}">${l.cage_label}</span></td>
-        <td>${escapeHtml(l.system)}</td>
-        <td>${escapeHtml(l.data_object)}</td>
-        <td class="num">${l.estimated_tokens.toLocaleString()}</td>
-        <td class="num">${l.confidence.toFixed(2)}</td>
-        <td>${escapeHtml(l.rationale)}</td>
+        <td>${escapeHtml(o.observed_at)}</td>
+        <td>${escapeHtml(o.node_name)}</td>
+        <td><span class="pill pill-${o.cage_label}">${o.cage_label}</span></td>
+        <td>${escapeHtml(o.system)}</td>
+        <td>${escapeHtml(o.session_id)}</td>
+        <td class="num">${o.confidence.toFixed(2)}</td>
+        <td>${o.evidence_frame_ids.length}</td>
       </tr>`;
   });
-  if (data.labels.length === 0) ltb.innerHTML = '<tr><td colspan="7" class="empty">No labels yet.</td></tr>';
+  if (data.observations.length === 0) otb.innerHTML = '<tr><td colspan="7" class="empty">No observations yet.</td></tr>';
 
   // Cost
-  const ctb = document.getElementById('cost-tbody');
-  const labels = ['C', 'A', 'G', 'E'];
-  const names = { C: 'Capture', A: 'Analyze', G: 'Generate', E: 'Extract' };
-  let any = false;
-  labels.forEach(k => {
-    const r = data.cost_summary[k];
-    if (!r) return;
-    any = true;
-    const avg = r.count ? Math.round(r.tokens / r.count) : 0;
-    ctb.innerHTML += `
-      <tr>
-        <td><span class="pill pill-${k}">${k}</span> ${names[k]}</td>
-        <td class="num">${r.count}</td>
-        <td class="num">${r.tokens.toLocaleString()}</td>
-        <td class="num">${avg.toLocaleString()}</td>
-      </tr>`;
-  });
-  if (any) document.getElementById('cost-empty').style.display = 'none';
+  const ctc = document.getElementById('cost-content');
+  if (!data.cost_summary || data.cost_summary.length === 0) {
+    ctc.innerHTML = '<p class="empty">Cost rolls up per workflow once labels exist.</p>';
+  } else {
+    let html = '';
+    data.cost_summary.forEach(w => {
+      html += `
+        <div style="background:#fff; border:1px solid #ddd; border-radius:6px; padding:16px; margin-bottom:16px">
+          <h2 style="margin:0 0 8px 0; font-size:16px">${escapeHtml(w.name)}</h2>
+          <div style="font-size:13px; color:#444; margin-bottom:8px">
+            One execution of this workflow ≈ <b>${w.per_execution_tokens.toLocaleString()}</b> agent tokens
+            across ${w.node_count} action(s).
+          </div>
+          <table>
+            <thead><tr><th>CAGE</th><th class="num">Tokens per execution</th></tr></thead>
+            <tbody>`;
+      ['C','A','G','E'].forEach(k => {
+        const v = w.cage_breakdown[k] || 0;
+        if (v === 0) return;
+        const names = {C:'Capture', A:'Analyze', G:'Generate', E:'Extract'};
+        html += `<tr><td><span class="pill pill-${k}">${k}</span> ${names[k]}</td><td class="num">${v.toLocaleString()}</td></tr>`;
+      });
+      html += `</tbody></table></div>`;
+    });
+    ctc.innerHTML = html;
+  }
 
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, c => ({
