@@ -24,20 +24,28 @@ move under a "Done" section per phase.
 
 ## Cross-cutting — Visualizer and tests (built alongside every phase)
 
-A single Streamlit app at `src/screen_workflow/viz/app.py` that grows tabs
-as each phase ships. Each phase also produces a `tests/fixtures/phaseN/`
-canned dataset that doubles as the visualizer's demo data, so we never
-need to capture live screens to verify.
+A **static-HTML report generator** at `src/screen_workflow/viz/`. After any
+phase produces output, run `python -m screen_workflow.viz <session_id>` to
+emit `viz_output/<session>/index.html` — a single self-contained file with
+images base64-inlined and JSON data inlined in `<script>` tags. No server,
+no CORS, no Python required to view. Double-click the file, browser opens.
 
-- [ ] `viz/` package + Streamlit entry point; reads the local DB + `screens/`.
-- [ ] **Tab — Events** (Phase 1): chronological event table; row click
-      → screenshot + OCR text + UI tree dump.
-- [ ] **Tab — Sessions** (Phase 2): timeline with session boundaries.
-- [ ] **Tab — Batches** (Phase 3): preview of the Claude request
+The HTML has tabbed sections that fill in as phases ship. Each phase also
+produces a `tests/fixtures/phaseN/` canned dataset that doubles as the
+report's demo data, so we never need to capture live screens to verify.
+
+- [ ] `viz/` package + `__main__.py` CLI entry; reads the local DB +
+      `screens/` and emits a static HTML file.
+- [ ] Base HTML template + vanilla-JS tab switcher (no framework, no
+      build step).
+- [ ] **Section — Events** (Phase 1): chronological event table; row
+      click → screenshot + OCR text + UI tree dump.
+- [ ] **Section — Sessions** (Phase 2): timeline with session boundaries.
+- [ ] **Section — Batches** (Phase 3): preview of the Claude request
       (event-log table + selected images + token count, no API call).
-- [ ] **Tab — Labels** (Phase 4): input frames + Claude's segmentation +
+- [ ] **Section — Labels** (Phase 4): input frames + Claude's segmentation +
       CAGE labels + confidence + rationale, side by side.
-- [ ] **Tab — Cost** (Phase 5): aggregate token-cost estimates.
+- [ ] **Section — Cost** (Phase 5): aggregate token-cost estimates.
 - [ ] Per-phase test layout: `tests/test_phase{N}_*.py` + fixture dir.
       Use snapshot tests (`syrupy` or hand-rolled) for stage outputs.
 - [ ] `--smoke` mode on the daemon: 60 s real capture into a sandbox DB
