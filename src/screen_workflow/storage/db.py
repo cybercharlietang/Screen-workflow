@@ -65,13 +65,15 @@ CREATE TABLE IF NOT EXISTS workflows (
 );
 
 CREATE TABLE IF NOT EXISTS observations (
-    observation_id     TEXT PRIMARY KEY,
-    workflow_id        TEXT NOT NULL,
-    session_id         TEXT NOT NULL,
-    node_id            TEXT NOT NULL,
-    evidence_frame_ids TEXT NOT NULL,
-    confidence         REAL NOT NULL,
-    observed_at        TEXT NOT NULL
+    observation_id       TEXT PRIMARY KEY,
+    workflow_id          TEXT NOT NULL,
+    session_id           TEXT NOT NULL,
+    node_id              TEXT NOT NULL,
+    evidence_frame_ids   TEXT NOT NULL,
+    estimated_tokens     INTEGER NOT NULL DEFAULT 0,
+    expected_agent_steps INTEGER NOT NULL DEFAULT 1,
+    confidence           REAL NOT NULL,
+    observed_at          TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_obs_workflow ON observations(workflow_id);
 CREATE INDEX IF NOT EXISTS idx_obs_session ON observations(session_id);
@@ -206,13 +208,15 @@ class Store:
 
     def insert_observation(self, obs: Observation) -> None:
         self._conn.execute(
-            "INSERT OR REPLACE INTO observations VALUES (?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO observations VALUES (?,?,?,?,?,?,?,?,?)",
             (
                 obs.observation_id,
                 obs.workflow_id,
                 obs.session_id,
                 obs.node_id,
                 json.dumps(obs.evidence_frame_ids),
+                obs.estimated_tokens,
+                obs.expected_agent_steps,
                 obs.confidence,
                 obs.observed_at.isoformat(),
             ),
@@ -239,8 +243,10 @@ class Store:
                 session_id=row[2],
                 node_id=row[3],
                 evidence_frame_ids=json.loads(row[4]),
-                confidence=row[5],
-                observed_at=datetime.fromisoformat(row[6]),
+                estimated_tokens=row[5],
+                expected_agent_steps=row[6],
+                confidence=row[7],
+                observed_at=datetime.fromisoformat(row[8]),
             )
 
     # -- lifecycle ---------------------------------------------------------

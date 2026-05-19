@@ -5,7 +5,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from screen_workflow.labeler.api import _extract_json, _merge_into_workflow, _new_workflow
+from screen_workflow.labeler.api import (
+    _extract_json,
+    _merge_into_workflow,
+    _new_workflow,
+    _select_or_create_workflow,
+)
 from screen_workflow.labeler.batch import APPROX_TOKENS_PER_IMAGE, build_batch
 from screen_workflow.schemas import (
     Event,
@@ -79,7 +84,9 @@ class TestMerge:
     def _events_by_id(self) -> dict:
         return {"f_000": _event(0), "f_001": _event(1)}
 
-    def test_first_call_creates_nodes_and_resets_stable(self) -> None:
+    def test_first_call_creates_nodes_and_resets_stable(self, tmp_path) -> None:
+        from screen_workflow.storage.db import Store
+        store = Store(tmp_path / "data")
         wf = _new_workflow("PO Approval")
         response = {
             "added_or_updated_nodes": [
@@ -89,8 +96,6 @@ class TestMerge:
                     "cage_label": "C",
                     "system": "Outlook",
                     "data_object_pattern": "PO #<num>",
-                    "estimated_tokens": 900,
-                    "expected_agent_steps": 1,
                     "confidence": 0.9,
                     "rationale": "User opened approval email.",
                     "is_new": True,
@@ -101,18 +106,23 @@ class TestMerge:
                 {
                     "node_id": "open-po-email",
                     "evidence_frame_ids": ["f_000"],
+                    "estimated_tokens": 900,
+                    "expected_agent_steps": 1,
                     "confidence": 0.9,
                 }
             ],
         }
-        wf, obs, changed = _merge_into_workflow(wf, response, self._session(), self._events_by_id())
+        wf, obs, changed = _merge_into_workflow(wf, response, self._session(), self._events_by_id(), store)
         assert "open-po-email" in wf.nodes
-        assert wf.nodes["open-po-email"].observation_count == 2  # creation + observation
+        assert wf.nodes["open-po-email"].observation_count == 1
+        assert wf.nodes["open-po-email"].estimated_tokens == 900  # mean of one obs
         assert len(obs) == 1
         assert changed is True
         assert wf.stable_observations == 0
 
-    def test_repeat_observation_increments_count_no_structural_change(self) -> None:
+    def test_repeat_observation_increments_count_no_structural_change(self, tmp_path) -> None:
+        from screen_workflow.storage.db import Store
+        store = Store(tmp_path / "data")
         wf = _new_workflow("PO Approval")
         response_1 = {
             "added_or_updated_nodes": [
@@ -122,8 +132,6 @@ class TestMerge:
                     "cage_label": "C",
                     "system": "Outlook",
                     "data_object_pattern": "p",
-                    "estimated_tokens": 500,
-                    "expected_agent_steps": 1,
                     "confidence": 0.8,
                     "rationale": "",
                     "is_new": True,
@@ -131,12 +139,18 @@ class TestMerge:
             ],
             "added_or_updated_edges": [],
             "observations": [
-                {"node_id": "n", "evidence_frame_ids": ["f_000"], "confidence": 0.8}
+                {
+                    "node_id": "n",
+                    "evidence_frame_ids": ["f_000"],
+                    "estimated_tokens": 500,
+                    "expected_agent_steps": 1,
+                    "confidence": 0.8,
+                }
             ],
         }
-        wf, _, _ = _merge_into_workflow(wf, response_1, self._session(), self._events_by_id())
+        wf, _, _ = _merge_into_workflow(wf, response_1, self._session(), self._events_by_id(), store)
 
-        # second call: same node, no new structure
+        # second call: same node, no new structure, different token estimate
         sess2 = Session(
             session_id="sess_2",
             start_ts=T0 + timedelta(hours=1),
@@ -148,21 +162,28 @@ class TestMerge:
             "added_or_updated_nodes": [],
             "added_or_updated_edges": [],
             "observations": [
-                {"node_id": "n", "evidence_frame_ids": ["f_000"], "confidence": 0.85}
+                {
+                    "node_id": "n",
+                    "evidence_frame_ids": ["f_000"],
+                    "estimated_tokens": 700,
+                    "expected_agent_steps": 1,
+                    "confidence": 0.85,
+                }
             ],
         }
-        wf, obs, changed = _merge_into_workflow(wf, response_2, sess2, self._events_by_id())
+        wf, obs, changed = _merge_into_workflow(wf, response_2, sess2, self._events_by_id(), store)
         assert changed is False
         assert wf.stable_observations == 1
-        assert wf.nodes["n"].observation_count == 3  # created(1) + obs(1) + obs(1)
+        assert wf.nodes["n"].observation_count == 2  # obs(1) + obs(1)
+        # mean of 500 and 700
+        assert wf.nodes["n"].estimated_tokens == 600
 
-    def test_stability_threshold_marks_complete(self) -> None:
+    def test_stability_threshold_marks_complete(self, tmp_path) -> None:
+        from screen_workflow.schemas import CAGELabel, WorkflowNode
+        from screen_workflow.storage.db import Store
+        store = Store(tmp_path / "data")
         wf = _new_workflow("PO Approval")
         wf.stability_threshold = 3
-        wf.nodes["n"] = _new_workflow("dummy").nodes  # placeholder; we'll set below
-        # easier: create the node properly
-        from screen_workflow.schemas import CAGELabel, WorkflowNode
-
         wf.nodes = {
             "n": WorkflowNode(
                 node_id="n",
@@ -182,7 +203,7 @@ class TestMerge:
                 close_reason=SessionCloseReason.IDLE_GAP,
                 event_ids=["f_000"],
             )
-            wf, _, _ = _merge_into_workflow(wf, no_op, sess, self._events_by_id())
+            wf, _, _ = _merge_into_workflow(wf, no_op, sess, self._events_by_id(), store)
         assert wf.is_complete is True
 
 

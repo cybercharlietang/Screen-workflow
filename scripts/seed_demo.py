@@ -137,11 +137,11 @@ def main() -> int:
     )
     store.upsert_workflow(wf)
 
-    for i, (node_id, frames) in enumerate(
+    for i, (node_id, frames, tokens, steps) in enumerate(
         [
-            ("read-po-email", ["demo_000"]),
-            ("reconcile-vendor-budget", ["demo_001", "demo_002"]),
-            ("draft-approval-reply", ["demo_004"]),
+            ("read-po-email", ["demo_000"], 900, 1),
+            ("reconcile-vendor-budget", ["demo_001", "demo_002"], 4200, 3),
+            ("draft-approval-reply", ["demo_004"], 2100, 2),
         ]
     ):
         store.insert_observation(
@@ -151,6 +151,8 @@ def main() -> int:
                 session_id="demo-sess-1",
                 node_id=node_id,
                 evidence_frame_ids=frames,
+                estimated_tokens=tokens,
+                expected_agent_steps=steps,
                 confidence=0.85,
                 observed_at=T0 + timedelta(minutes=i * 2),
             )

@@ -104,9 +104,12 @@ def test_observation_round_trip(store: Store) -> None:
         session_id="sess_1",
         node_id="open-po",
         evidence_frame_ids=["f1", "f2"],
+        estimated_tokens=1234,
+        expected_agent_steps=2,
         confidence=0.85,
         observed_at=T0,
     )
     store.insert_observation(obs)
     [round_tripped] = list(store.iter_observations())
     assert round_tripped == obs
+    assert round_tripped.estimated_tokens == 1234

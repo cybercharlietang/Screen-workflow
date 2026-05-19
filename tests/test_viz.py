@@ -76,6 +76,8 @@ def test_render_produces_self_contained_html(tmp_path: Path) -> None:
             session_id="s1",
             node_id="n",
             evidence_frame_ids=["abc"],
+            estimated_tokens=1234,
+            expected_agent_steps=1,
             confidence=0.8,
             observed_at=T0,
         )

@@ -182,7 +182,14 @@ class Workflow(BaseModel):
 
 
 class Observation(BaseModel):
-    """Records that frames in a session mapped to a workflow node."""
+    """Records that frames in a session mapped to a workflow node.
+
+    Each observation carries its own per-instance token estimate; the
+    node's headline ``estimated_tokens`` is the mean across all
+    observations that map to it. Storing per-observation values lets us
+    aggregate (mean / variance / outliers) instead of relying on one
+    estimate made at node creation time.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -191,5 +198,11 @@ class Observation(BaseModel):
     session_id: str
     node_id: str
     evidence_frame_ids: list[str] = Field(min_length=1)
+    estimated_tokens: int = Field(
+        ge=0,
+        default=0,
+        description="Per-instance: tokens an agent would use this time.",
+    )
+    expected_agent_steps: int = Field(ge=1, default=1)
     confidence: float = Field(ge=0.0, le=1.0)
     observed_at: datetime

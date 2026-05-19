@@ -1,14 +1,9 @@
-"""Per-workflow labeler: each Claude call ingests one session's batch and
-incrementally updates the workflow graph.
+"""Auto-routing per-workflow labeler.
 
-Flow per session:
-    1. Load (or create) the named Workflow.
-    2. Build a multimodal batch from the session's events.
-    3. Send Claude: current Workflow JSON + new batch + instructions.
-    4. Parse response: list of Observations + (possibly) new/updated nodes/edges.
-    5. Merge into the Workflow, persist; emit Observation rows.
-    6. Detect stability (no new nodes/edges added) and mark complete after
-       ``stability_threshold`` consecutive stable updates.
+For each session: Claude sees the directory of existing workflows (compact
+summaries) and the new session. It either updates an existing workflow or
+creates a new one, and emits per-observation token estimates that get
+aggregated into the node's mean estimated_tokens.
 """
 
 from __future__ import annotations
@@ -45,64 +40,67 @@ class LabelerError(RuntimeError):
     pass
 
 
-# ---------------------------------------------------------------------------
-# Prompt
-# ---------------------------------------------------------------------------
-
-
 SYSTEM_PROMPT = """\
-You are a procurement-workflow analyst at Fragment. Your job is to maintain
-a **workflow graph** — a model of one specific procurement workflow as
-observed across many employee sessions.
+You are a procurement-workflow analyst at Fragment. You maintain a **directory
+of workflow graphs**. Each workflow models one type of procurement task as
+observed across many employee sessions (e.g. "Monitor purchase",
+"Invoice reconciliation"). The output is the workflow graph itself —
+unique abstract actions with observation counts and agent-token cost
+estimates.
 
-You will receive on each call:
-  1. The CURRENT workflow graph (JSON with nodes + edges + observation counts).
-  2. A NEW session's event log + screenshots.
+For each call you receive:
+  1. DIRECTORY OF EXISTING WORKFLOWS — each one with its full graph
+     (nodes, edges, observation_counts).
+  2. NEW SESSION — event log + screenshots.
 
-Your job per call: identify the cognitive actions in the new session and
-UPDATE the workflow graph by:
+YOU MUST:
 
-  A) Mapping observed actions to EXISTING nodes when they match (an action
-     matches a node if the cognitive intent is the same — same CAGE label,
-     same system, same generic data_object_pattern). Increment that node's
-     ``observation_count``.
-  B) Creating NEW nodes only when you genuinely observe an action that does
-     not match any existing node.
-  C) Adding/updating edges for the transitions observed in this session.
+  A) Decide whether the new session belongs to one of the existing
+     workflows or is a NEW one. Match on cognitive task, not surface
+     details. If the directory is empty, treat the session as starting
+     a new workflow.
+
+  B) For the chosen / new workflow, identify the cognitive actions in
+     the new session and produce:
+       - any new or updated nodes
+       - any new or updated edges
+       - one Observation per cognitive action you see in THIS session
+         (each Observation maps to one node, with its OWN per-instance
+         estimated_tokens — these aggregate across sessions to give a
+         mean per node).
+
+  C) Repeated actions across sessions collapse to ONE node. If a session
+     shows the user "Open PO email" five times, that's ONE node with
+     observation_count=5 across sessions, not five nodes.
 
 CAGE taxonomy:
-  C — Capture: ingesting data (reading email, opening record, downloading PDF)
+  C — Capture: ingesting data (reading email, opening record, downloading)
   A — Analyze: interpreting / comparing / deciding
-  G — Generate: producing new content (drafts, comments, reports)
+  G — Generate: producing new content (drafts, replies, reports)
   E — Extract: pulling structured fields from unstructured sources
 
-CRUCIAL guidelines:
+Guidelines:
+  * data_object_pattern is GENERIC: "PO #<num>" not "PO #12345".
+  * Merge into cognitive units: 5 clicks in one form = 1 node, not 5.
+  * Ignore noise: Slack pings, lunch, unrelated browsing — omit.
+  * estimated_tokens per observation = input + output of ONE LLM call an
+    agent would make to do this action this time. Ranges:
+      Capture / Extract: 500–3,000   |   Analyze: 2,000–8,000
+      Generate: 1,500–10,000
+  * expected_agent_steps per observation: 1 (read+act), 2–3 (compare+decide),
+    4+ (genuinely multi-step).
+  * confidence 0.0–1.0 — be honest.
+  * node_id for new nodes: short kebab-case from canonical_name.
 
-1. **Repeated actions collapse to ONE node.** If "Open PO email in Outlook"
-   appears 5 times across sessions, it is ONE node with observation_count=5,
-   not 5 nodes.
-2. **data_object_pattern is generic.** Use "PO #<num>", not "PO #12345".
-   Use "<vendor>", not "Acme Corp".
-3. **Merge into cognitive units.** Five clicks while filling one form is
-   ONE node ("filled out vendor form"), not five.
-4. **Ignore noise.** Slack pings, lunch breaks, unrelated browsing — omit.
-5. **estimated_tokens** = input + output of ONE LLM call an agent would
-   make to perform this action. Typical ranges:
-     - Capture / Extract: 500–3,000
-     - Analyze: 2,000–8,000
-     - Generate: 1,500–10,000
-6. **expected_agent_steps** = how many LLM calls an agent needs:
-     - 1 for read+act (open and read)
-     - 2–3 for compare+decide
-     - 4+ only for genuinely multi-step actions
-7. **confidence 0.0–1.0**: how sure you are the screenshots support the
-   identification. Be honest.
-8. **node_id** for new nodes: short kebab-case from canonical_name
-   (e.g. "open-po-email").
-
-Return ONLY JSON of this shape:
+Return ONLY this JSON shape (no prose, no markdown fences):
 
 {
+  "target_workflow": {
+    "kind": "existing" | "new",
+    "existing_id": "wf_..." | null,
+    "new_name": "Short workflow name (only if kind=new)" | null,
+    "rationale": "one short sentence on why this workflow"
+  },
   "added_or_updated_nodes": [
     {
       "node_id": "...",
@@ -110,8 +108,6 @@ Return ONLY JSON of this shape:
       "cage_label": "C|A|G|E",
       "system": "...",
       "data_object_pattern": "...",
-      "estimated_tokens": 2500,
-      "expected_agent_steps": 1,
       "confidence": 0.82,
       "rationale": "one short sentence",
       "is_new": true
@@ -124,71 +120,74 @@ Return ONLY JSON of this shape:
     {
       "node_id": "...",
       "evidence_frame_ids": ["...", "..."],
+      "estimated_tokens": 2500,
+      "expected_agent_steps": 1,
       "confidence": 0.85
     }
   ]
 }
 
-- ``is_new=true`` for nodes you are adding for the first time.
-- ``is_new=false`` for existing nodes you are merely updating
-  (we will increment their observation_count regardless).
-- ``edges`` is just the transitions you observed in THIS session — we
-  will increment counts on our side.
-- ``observations`` is one entry per cognitive action seen in this session
-  (so a session typically yields 3–15 observations).
-- NO prose outside the JSON.
+Rules:
+  * If target_workflow.kind == "existing", existing_id MUST be one of the
+    ids in the directory. new_name is null.
+  * If kind == "new", new_name MUST be non-empty. existing_id is null.
+  * Every observation.node_id must match either a node already in the
+    chosen workflow OR a node you are introducing in added_or_updated_nodes.
+  * Every edge endpoint must be a known node id.
 """
 
 
 # ---------------------------------------------------------------------------
-# Message construction
+# Directory + prompt construction
 # ---------------------------------------------------------------------------
 
 
-def _compact_workflow_for_prompt(workflow: Workflow) -> str:
-    """JSON representation passed to Claude — strip fields it doesn't need to
-    avoid wasting tokens."""
-    return json.dumps(
-        {
-            "workflow_id": workflow.workflow_id,
-            "name": workflow.name,
-            "nodes": [
-                {
-                    "node_id": n.node_id,
-                    "canonical_name": n.canonical_name,
-                    "cage_label": n.cage_label.value,
-                    "system": n.system,
-                    "data_object_pattern": n.data_object_pattern,
-                    "estimated_tokens": n.estimated_tokens,
-                    "expected_agent_steps": n.expected_agent_steps,
-                    "observation_count": n.observation_count,
-                }
-                for n in workflow.nodes.values()
-            ],
-            "edges": [
-                {"from": e.from_node, "to": e.to_node, "count": e.observation_count}
-                for e in workflow.edges
-            ],
-            "sessions_processed": len(workflow.sessions_processed),
-            "stable_observations": workflow.stable_observations,
-        },
-        indent=2,
-    )
+def _workflow_directory(store: Store) -> list[dict]:
+    """Compact representation of every existing workflow, suitable for prompting."""
+    directory = []
+    for wf in store.iter_workflows():
+        directory.append(
+            {
+                "workflow_id": wf.workflow_id,
+                "name": wf.name,
+                "is_complete": wf.is_complete,
+                "sessions_processed": len(wf.sessions_processed),
+                "nodes": [
+                    {
+                        "node_id": n.node_id,
+                        "canonical_name": n.canonical_name,
+                        "cage_label": n.cage_label.value,
+                        "system": n.system,
+                        "data_object_pattern": n.data_object_pattern,
+                        "estimated_tokens_mean": n.estimated_tokens,
+                        "expected_agent_steps": n.expected_agent_steps,
+                        "observation_count": n.observation_count,
+                    }
+                    for n in wf.nodes.values()
+                ],
+                "edges": [
+                    {"from": e.from_node, "to": e.to_node, "count": e.observation_count}
+                    for e in wf.edges
+                ],
+            }
+        )
+    return directory
 
 
-def _build_messages(workflow: Workflow, batch) -> list[dict]:
+def _build_messages(directory: list[dict], batch) -> list[dict]:
     user_content: list[dict] = [
         {
             "type": "text",
             "text": (
-                f"WORKFLOW NAME: {workflow.name}\n\n"
-                f"CURRENT WORKFLOW STATE:\n```json\n"
-                f"{_compact_workflow_for_prompt(workflow)}\n```\n\n"
+                "DIRECTORY OF EXISTING WORKFLOWS "
+                f"({'empty — this session starts a new workflow' if not directory else f'{len(directory)} workflow(s)'}):\n"
+                "```json\n"
+                f"{json.dumps(directory, indent=2)}\n"
+                "```\n\n"
                 "NEW SESSION EVENT LOG (tab-separated, one row per kept frame):\n\n"
                 f"{batch.event_log_text}\n\n"
-                "Screenshots follow, in chronological order; each is preceded "
-                "by a small text marker with its frame_id and ts. Cite those "
-                "ids in evidence_frame_ids."
+                "Screenshots follow in chronological order. Each is preceded by a "
+                "text marker giving its frame_id and ts."
             ),
         },
         *batch.images,
@@ -215,49 +214,91 @@ def _extract_json(text: str) -> dict:
         raise LabelerError(f"response not valid JSON: {e}") from e
 
 
+def _select_or_create_workflow(
+    store: Store, response: dict, force_name: str | None = None
+) -> Workflow:
+    """Choose the target workflow per Claude's verdict, or create a new one."""
+    tw = response.get("target_workflow") or {}
+    kind = tw.get("kind")
+    now = datetime.now(timezone.utc)
+
+    if force_name:
+        existing = store.find_workflow_by_name(force_name)
+        if existing is not None:
+            return existing
+        return _new_workflow(force_name)
+
+    if kind == "existing":
+        eid = tw.get("existing_id")
+        if eid:
+            wf = store.get_workflow(eid)
+            if wf is not None:
+                return wf
+            log.warning(
+                "Claude routed to workflow_id=%s but it was not found; creating new",
+                eid,
+            )
+    name = tw.get("new_name") or "Untitled workflow"
+    return _new_workflow(name)
+
+
+def _new_workflow(workflow_name: str) -> Workflow:
+    now = datetime.now(timezone.utc)
+    return Workflow(
+        workflow_id=f"wf_{uuid.uuid4().hex[:10]}",
+        name=workflow_name,
+        nodes={},
+        edges=[],
+        sessions_processed=[],
+        stable_observations=0,
+        is_complete=False,
+        created_at=now,
+        last_updated_at=now,
+    )
+
+
 def _merge_into_workflow(
     workflow: Workflow,
     response: dict,
     session: Session,
     events_by_id: dict[str, Event],
+    store: Store,
 ) -> tuple[Workflow, list[Observation], bool]:
-    """Apply Claude's response to the workflow. Return (updated_workflow,
-    observations, structurally_changed)."""
+    """Apply Claude's response to the workflow + insert observations.
+
+    The per-node ``estimated_tokens`` becomes the mean across the node's
+    observations (recomputed after each merge).
+    """
     now = datetime.now(timezone.utc)
     structurally_changed = False
 
-    # Nodes
+    # Nodes (create-or-touch)
     for raw in response.get("added_or_updated_nodes", []) or []:
         try:
             node_id = str(raw["node_id"])
-            existing = workflow.nodes.get(node_id)
-            if existing is None:
+            if node_id not in workflow.nodes:
                 workflow.nodes[node_id] = WorkflowNode(
                     node_id=node_id,
                     canonical_name=str(raw["canonical_name"]),
                     cage_label=CAGELabel(raw["cage_label"]),
                     system=str(raw["system"]),
                     data_object_pattern=str(raw["data_object_pattern"]),
-                    estimated_tokens=int(raw.get("estimated_tokens", 0)),
-                    expected_agent_steps=int(raw.get("expected_agent_steps", 1)),
-                    observation_count=1,
+                    estimated_tokens=0,  # mean will be computed from observations
+                    expected_agent_steps=1,
+                    observation_count=0,
                     confidence=float(raw.get("confidence", 0.5)),
                     rationale=str(raw.get("rationale", "")),
                 )
                 structurally_changed = True
                 log.info("new node: %s — %s", node_id, raw["canonical_name"])
             else:
-                # Update — Claude may refine token estimates as it sees more samples
-                existing.estimated_tokens = max(
-                    existing.estimated_tokens, int(raw.get("estimated_tokens", existing.estimated_tokens))
-                )
-                existing.confidence = max(
-                    existing.confidence, float(raw.get("confidence", existing.confidence))
-                )
+                # Refine confidence upward only
+                n = workflow.nodes[node_id]
+                n.confidence = max(n.confidence, float(raw.get("confidence", n.confidence)))
         except (KeyError, ValueError, ValidationError) as e:
             log.warning("skipping malformed node: %s | %r", e, raw)
 
-    # Edges (added if new pair)
+    # Edges
     existing_edge_keys = {(e.from_node, e.to_node) for e in workflow.edges}
     for raw in response.get("added_or_updated_edges", []) or []:
         try:
@@ -265,20 +306,19 @@ def _merge_into_workflow(
             t = str(raw["to_node"])
             if f not in workflow.nodes or t not in workflow.nodes:
                 continue
-            key = (f, t)
-            if key not in existing_edge_keys:
+            if (f, t) not in existing_edge_keys:
                 workflow.edges.append(WorkflowEdge(from_node=f, to_node=t, observation_count=1))
-                existing_edge_keys.add(key)
+                existing_edge_keys.add((f, t))
                 structurally_changed = True
             else:
                 for e in workflow.edges:
-                    if (e.from_node, e.to_node) == key:
+                    if (e.from_node, e.to_node) == (f, t):
                         e.observation_count += 1
                         break
         except (KeyError, ValueError, ValidationError) as e:
             log.warning("skipping malformed edge: %s | %r", e, raw)
 
-    # Observations — and increment node observation_count
+    # Observations
     observations: list[Observation] = []
     for raw in response.get("observations", []) or []:
         try:
@@ -292,20 +332,38 @@ def _merge_into_workflow(
             ]
             if not evidence:
                 continue
-            workflow.nodes[node_id].observation_count += 1
-            observations.append(
-                Observation(
-                    observation_id=f"obs_{uuid.uuid4().hex[:10]}",
-                    workflow_id=workflow.workflow_id,
-                    session_id=session.session_id,
-                    node_id=node_id,
-                    evidence_frame_ids=evidence,
-                    confidence=float(raw.get("confidence", 0.7)),
-                    observed_at=now,
-                )
+            obs = Observation(
+                observation_id=f"obs_{uuid.uuid4().hex[:10]}",
+                workflow_id=workflow.workflow_id,
+                session_id=session.session_id,
+                node_id=node_id,
+                evidence_frame_ids=evidence,
+                estimated_tokens=int(raw.get("estimated_tokens", 0)),
+                expected_agent_steps=int(raw.get("expected_agent_steps", 1)),
+                confidence=float(raw.get("confidence", 0.7)),
+                observed_at=now,
             )
+            workflow.nodes[node_id].observation_count += 1
+            observations.append(obs)
         except (KeyError, ValueError, ValidationError) as e:
             log.warning("skipping malformed observation: %s | %r", e, raw)
+
+    # Persist new observations now so the mean computation sees them
+    for obs in observations:
+        store.insert_observation(obs)
+
+    # Recompute mean estimates per touched node from ALL observations of that node
+    touched_node_ids = {o.node_id for o in observations}
+    for nid in touched_node_ids:
+        all_obs = list(store.iter_observations(workflow_id=workflow.workflow_id))
+        for_node = [o for o in all_obs if o.node_id == nid]
+        if for_node:
+            workflow.nodes[nid].estimated_tokens = int(
+                sum(o.estimated_tokens for o in for_node) / len(for_node)
+            )
+            workflow.nodes[nid].expected_agent_steps = max(
+                1, round(sum(o.expected_agent_steps for o in for_node) / len(for_node))
+            )
 
     # Bookkeeping
     if session.session_id not in workflow.sessions_processed:
@@ -326,61 +384,32 @@ def _merge_into_workflow(
 # ---------------------------------------------------------------------------
 
 
-def _new_workflow(workflow_name: str) -> Workflow:
-    now = datetime.now(timezone.utc)
-    return Workflow(
-        workflow_id=f"wf_{uuid.uuid4().hex[:10]}",
-        name=workflow_name,
-        nodes={},
-        edges=[],
-        sessions_processed=[],
-        stable_observations=0,
-        is_complete=False,
-        created_at=now,
-        last_updated_at=now,
-    )
-
-
-def update_workflow_with_session(
+def update_with_session(
     store: Store,
-    workflow_name: str,
     session: Session,
     *,
+    force_workflow_name: str | None = None,
     model: str = DEFAULT_MODEL,
     api_key: str | None = None,
     dry_run: bool = False,
 ) -> tuple[Workflow, list[Observation]]:
-    """Process one session against the named workflow.
-
-    Returns ``(updated_workflow, new_observations)``.
-    """
-    workflow = store.find_workflow_by_name(workflow_name) or _new_workflow(workflow_name)
-    if session.session_id in workflow.sessions_processed:
-        log.info(
-            "session %s already processed for workflow %s; skipping",
-            session.session_id,
-            workflow_name,
-        )
-        return workflow, []
-    if workflow.is_complete:
-        log.info("workflow %s is marked complete; skipping", workflow_name)
-        return workflow, []
-
+    """Auto-route a session to a workflow (or create new) and update it."""
     events = list(store.iter_events(session.session_id))
     if not events:
-        return workflow, []
+        return _new_workflow("(empty)"), []
     events_by_id = {e.event_id: e for e in events}
 
+    directory = _workflow_directory(store)
     batch = build_batch(events, store.screens_dir)
     log.info(
-        "updating workflow '%s' with session %s: %d events, %d images selected",
-        workflow_name,
+        "labeling session %s: directory has %d workflows, %d events in session, %d images selected",
         session.session_id,
+        len(directory),
         len(events),
         len(batch.selected_frame_ids),
     )
     if dry_run:
-        return workflow, []
+        return _new_workflow("dry-run"), []
 
     try:
         import anthropic
@@ -395,7 +424,7 @@ def update_workflow_with_session(
         model=model,
         max_tokens=MAX_TOKENS,
         system=SYSTEM_PROMPT,
-        messages=_build_messages(workflow, batch),
+        messages=_build_messages(directory, batch),
     )
     text = "\n".join(b.text for b in resp.content if getattr(b, "type", None) == "text").strip()
     log.info(
@@ -405,17 +434,21 @@ def update_workflow_with_session(
     )
 
     response = _extract_json(text)
+    workflow = _select_or_create_workflow(store, response, force_name=force_workflow_name)
+    if session.session_id in workflow.sessions_processed:
+        log.info("session %s already in workflow %s; skipping", session.session_id, workflow.name)
+        return workflow, []
+
     workflow, observations, changed = _merge_into_workflow(
-        workflow, response, session, events_by_id
+        workflow, response, session, events_by_id, store
     )
     store.upsert_workflow(workflow)
-    for obs in observations:
-        store.insert_observation(obs)
 
     log.info(
-        "workflow '%s': %d nodes, %d edges, %d observations this call, "
+        "workflow '%s' (%s): %d nodes, %d edges, %d new observations, "
         "structural change=%s, stable=%d/%d, complete=%s",
         workflow.name,
+        workflow.workflow_id,
         len(workflow.nodes),
         len(workflow.edges),
         len(observations),
@@ -429,20 +462,25 @@ def update_workflow_with_session(
 
 def process_all_unprocessed_sessions(
     store: Store,
-    workflow_name: str,
     *,
+    force_workflow_name: str | None = None,
     model: str = DEFAULT_MODEL,
     dry_run: bool = False,
 ) -> int:
-    """Update the named workflow with every session not yet seen by it."""
-    workflow = store.find_workflow_by_name(workflow_name) or _new_workflow(workflow_name)
-    already = set(workflow.sessions_processed)
+    """Auto-route every session not yet recorded in any workflow."""
+    seen_session_ids: set[str] = set()
+    for wf in store.iter_workflows():
+        seen_session_ids.update(wf.sessions_processed)
     n_processed = 0
     for session in store.iter_sessions():
-        if session.session_id in already:
+        if session.session_id in seen_session_ids:
             continue
-        update_workflow_with_session(
-            store, workflow_name, session, model=model, dry_run=dry_run
+        update_with_session(
+            store,
+            session,
+            force_workflow_name=force_workflow_name,
+            model=model,
+            dry_run=dry_run,
         )
         n_processed += 1
     return n_processed
@@ -455,8 +493,8 @@ def main() -> int:
     p.add_argument("--root", default="./local_data")
     p.add_argument(
         "--workflow",
-        required=True,
-        help="Workflow name to update (PoC: caller picks). Created if missing.",
+        default=None,
+        help="OPTIONAL force-name override. If unset, Claude decides which workflow.",
     )
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--dry-run", action="store_true")
@@ -469,10 +507,13 @@ def main() -> int:
     )
     store = Store(Path(args.root))
     n = process_all_unprocessed_sessions(
-        store, args.workflow, model=args.model, dry_run=args.dry_run
+        store,
+        force_workflow_name=args.workflow,
+        model=args.model,
+        dry_run=args.dry_run,
     )
     store.close()
-    print(f"processed {n} new sessions into workflow '{args.workflow}'")
+    print(f"processed {n} new session(s)")
     return 0
 
 
