@@ -38,6 +38,12 @@ optimizing for "we can demo it" today, not "we can ship it."
 - Always challenge both the user's and your own reasoning. Surface tradeoffs,
   push back when something looks wrong, and verify assumptions before acting
   on them.
+- **Search for prior art before building.** Before designing a non-trivial
+  component (a tool, library, technique, taxonomy), do a thorough web search
+  for existing solutions — commercial and open-source. If something similar
+  exists, learn from it (architecture, taxonomy, failure modes) and decide
+  consciously whether to use it, fork it, or differentiate. Don't reinvent
+  silently. Recap findings in your response so the user can sanity-check.
 - One package, `screen_workflow`, under `src/`. Subpackages mirror the
   pipeline stages: `capture`, `enrich`, `session`, `labeler`, `storage`,
   `analytics`.

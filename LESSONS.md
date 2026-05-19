@@ -107,6 +107,44 @@ segmentation benefits from a clear taxonomy.
 
 ---
 
+## L8 — Prior art: task-mining is a mature commercial space; OSS is thin
+
+**Rule.** This is not a green field. Several major commercial tools already
+do "capture desktop activity + extract workflows", primarily targeted at
+RPA-automation discovery. Our differentiation is the *VLM interpretation +
+agent-token cost estimation* angle, not the capture itself.
+
+**Why.** Web search (2026-05-19) surfaced:
+
+- **UiPath Task Mining** — desktop event capture (clicks/keystrokes/app
+  switches) → task flow diagrams. Closest direct analog.
+- **Celonis** — process mining (system logs) + task mining hybrid.
+- **ABBYY Timeline** — DOM/COM + image-based recording via browser
+  plugins. Most architecturally similar to ours (hybrid pixel + structured
+  approach).
+- **Microsoft Power Automate Process Advisor** — uses a "Process Discovery
+  Agent" but operates on documentation, not screen capture.
+- **KYP.ai** and others — enterprise process-intelligence SaaS.
+
+No directly-replaceable open-source tool exists; the space is dominated by
+enterprise SaaS pricing ($10K+/year per bot for UiPath).
+
+**How to apply.** Frame the project as differentiated on three axes that
+incumbents don't own:
+1. **VLM-driven semantic interpretation** of screens instead of relying on
+   accessibility-tree scraping (which fails on legacy ERP UIs).
+2. **Agent-token cost estimation** as the primary output, not just
+   "automation candidates" — none of the incumbents price LLM-agent
+   replacement cost.
+3. **Privacy-local by design** — raw screen data never leaves the machine.
+   Most commercial tools require uploading recordings to vendor cloud.
+
+Worth glancing at ABBYY Timeline's hybrid recording model and UiPath's
+trigger-based event capture before locking architectural decisions — they
+likely already solved the obvious mistakes.
+
+---
+
 ## L7 — "What is PII vs. what is signal" is a project-viability question
 
 **Rule.** Vendor names, PO numbers, GL codes, dollar amounts are the
