@@ -62,17 +62,27 @@ class TestBatch:
         assert "frame_id\tts\tapp" in batch.event_log_text
         assert len(batch.selected_frame_ids) == 5
 
-    def test_downsamples_when_over_budget(self, tmp_path: Path) -> None:
+    def test_build_batches_splits_into_chunks(self, tmp_path: Path) -> None:
+        from screen_workflow.labeler.batch import (
+            MAX_IMAGES_PER_CHUNK,
+            build_batches,
+        )
         screens = tmp_path / "screens"
         events = []
-        for i in range(40):
+        for i in range(MAX_IMAGES_PER_CHUNK * 2 + 5):
             events.append(_event(i))
             _png(screens / f"x_{i}.png")
-        budget = 5_000 + 5 * APPROX_TOKENS_PER_IMAGE
-        batch = build_batch(events, screens, budget_tokens=budget)
-        assert len(batch.selected_frame_ids) < 40
-        assert events[0].event_id in batch.selected_frame_ids
-        assert events[-1].event_id in batch.selected_frame_ids
+        batches = build_batches(events, screens)
+        # We should have at least 3 batches because we exceed 2× the image cap.
+        assert len(batches) >= 3
+        # All images present across batches; no dropping.
+        all_ids = []
+        for b in batches:
+            all_ids.extend(b.selected_frame_ids)
+        assert sorted(all_ids) == sorted(e.event_id for e in events)
+        # Each batch holds at most MAX_IMAGES_PER_CHUNK.
+        for b in batches:
+            assert len(b.selected_frame_ids) <= MAX_IMAGES_PER_CHUNK
 
 
 class TestMergeResponse:

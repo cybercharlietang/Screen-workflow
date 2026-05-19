@@ -22,7 +22,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from screen_workflow.labeler.batch import build_batch
+from screen_workflow.labeler.batch import build_batches
 from screen_workflow.schemas import (
     CAGELabel,
     Event,
@@ -250,6 +250,7 @@ def _write_audit(
     noise_count: int,
     model: str,
     usage,
+    n_chunks: int = 1,
 ) -> None:
     """Persist what Claude returned for this session, for the Pipeline view."""
     try:
@@ -259,10 +260,11 @@ def _write_audit(
             "session_id": session.session_id,
             "ts": datetime.now(timezone.utc).isoformat(),
             "model": model,
+            "n_chunks": n_chunks,
             "batch": {
-                "selected_frame_ids": batch.selected_frame_ids,
-                "dropped_frame_ids": batch.dropped_frame_ids,
-                "approx_input_tokens": batch.approx_input_tokens,
+                "selected_frame_ids": batch.selected_frame_ids if batch else [],
+                "dropped_frame_ids": batch.dropped_frame_ids if batch else [],
+                "approx_input_tokens": batch.approx_input_tokens if batch else 0,
             },
             "claude_response": response,
             "summary": {
@@ -542,20 +544,23 @@ def process_session(
     api_key: str | None = None,
     dry_run: bool = False,
 ) -> tuple[dict[str, Workflow], list[Observation], int]:
-    """Run Claude on one session; merge into possibly-many workflows."""
+    """Run Claude on one session, splitting into multiple chunks if needed.
+
+    Each chunk = one Anthropic call. The workflow graph in the store gets
+    updated after each chunk, so the next chunk's directory reflects the
+    state Claude built up so far — building the mental model incrementally.
+    """
     events = list(store.iter_events(session.session_id))
     if not events:
         return {}, [], 0
     events_by_id = {e.event_id: e for e in events}
 
-    directory = _workflow_directory(store)
-    batch = build_batch(events, store.screens_dir)
+    batches = build_batches(events, store.screens_dir)
     log.info(
-        "labeling session %s: directory has %d workflow(s), session has %d events, %d images selected",
+        "labeling session %s in %d chunk(s); total %d events",
         session.session_id,
-        len(directory),
+        len(batches),
         len(events),
-        len(batch.selected_frame_ids),
     )
     if dry_run:
         return {}, [], 0
@@ -569,40 +574,67 @@ def process_session(
     if client.api_key is None:
         raise LabelerError("ANTHROPIC_API_KEY not set")
 
-    resp = client.messages.create(
-        model=model,
-        max_tokens=MAX_TOKENS,
-        system=SYSTEM_PROMPT,
-        messages=_build_messages(directory, batch),
-    )
-    text = "\n".join(b.text for b in resp.content if getattr(b, "type", None) == "text").strip()
-    log.info(
-        "claude returned %d output tokens (stop_reason=%s)",
-        getattr(resp.usage, "output_tokens", -1),
-        resp.stop_reason,
-    )
+    all_touched: dict[str, Workflow] = {}
+    all_observations: list[Observation] = []
+    total_noise = 0
+    last_response = None
+    last_batch = None
+    last_usage = None
 
-    response = _extract_json(text)
-    touched, observations, noise_count = merge_response(
-        response, session, events_by_id, store
-    )
-    for wf in touched.values():
-        store.upsert_workflow(wf)
+    for i, batch in enumerate(batches, start=1):
+        # Re-read the directory each chunk so Claude sees the workflow state
+        # produced by previous chunks of this same session.
+        directory = _workflow_directory(store)
+        log.info(
+            "  chunk %d/%d: directory has %d workflow(s), %d images",
+            i,
+            len(batches),
+            len(directory),
+            len(batch.selected_frame_ids),
+        )
 
-    # Persist a per-session audit JSON so the visualizer (and you) can see
-    # exactly what Claude said for this session — independent of how it got
-    # merged into the workflow graph.
-    _write_audit(
-        store.root,
-        session=session,
-        batch=batch,
-        response=response,
-        touched_workflows=touched,
-        observations=observations,
-        noise_count=noise_count,
-        model=model,
-        usage=getattr(resp, "usage", None),
-    )
+        resp = client.messages.create(
+            model=model,
+            max_tokens=MAX_TOKENS,
+            system=SYSTEM_PROMPT,
+            messages=_build_messages(directory, batch),
+        )
+        text = "\n".join(b.text for b in resp.content if getattr(b, "type", None) == "text").strip()
+        log.info(
+            "  chunk %d: claude returned %d output tokens (stop_reason=%s)",
+            i,
+            getattr(resp.usage, "output_tokens", -1),
+            resp.stop_reason,
+        )
+
+        response = _extract_json(text)
+        touched, observations, noise_count = merge_response(
+            response, session, events_by_id, store
+        )
+        for wf in touched.values():
+            store.upsert_workflow(wf)
+            all_touched[wf.workflow_id] = wf
+        all_observations.extend(observations)
+        total_noise += noise_count
+        last_response, last_batch, last_usage = response, batch, getattr(resp, "usage", None)
+
+    # Audit log: persist what happened across all chunks for this session.
+    if last_response is not None:
+        _write_audit(
+            store.root,
+            session=session,
+            batch=last_batch,
+            response=last_response,
+            touched_workflows=all_touched,
+            observations=all_observations,
+            noise_count=total_noise,
+            model=model,
+            usage=last_usage,
+            n_chunks=len(batches),
+        )
+    touched = all_touched
+    observations = all_observations
+    noise_count = total_noise
 
     log.info(
         "session %s -> %d workflow(s) touched, %d observations, %d noise actions",

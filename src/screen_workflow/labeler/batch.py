@@ -13,12 +13,9 @@ typical 1080p screenshot at default detail).
 from __future__ import annotations
 
 import base64
-import io
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-
-from PIL import Image
 
 from screen_workflow.schemas import Event
 
@@ -27,13 +24,12 @@ log = logging.getLogger(__name__)
 APPROX_TOKENS_PER_IMAGE = 1500
 DEFAULT_BUDGET = 400_000  # leave headroom below 500K for response generation
 
-# Anthropic per-request size cap is 32 MB. Full-resolution 1080p PNGs are
-# ~1.5 MB each, so a session of 30+ frames overflows that. We resize the
-# longest edge to 1280px and JPEG-encode at q=80 — still highly readable
-# for the model (text and UI elements remain crisp) but ~50-150 KB per
-# image, so a 100-image batch is comfortably ~10 MB.
-IMAGE_RESIZE_MAX_PX = 1280
-IMAGE_JPEG_QUALITY = 80
+# Anthropic per-request size cap is 32 MB. We send full-resolution PNGs
+# (no compression — pixel detail matters for OCR + UI element reading) and
+# split sessions into multiple chunks if the total payload would overflow.
+# Conservative budget per-chunk leaves headroom for the prompt + JSON output.
+MAX_CHUNK_PAYLOAD_BYTES = 20 * 1024 * 1024   # ~20 MB of base64-encoded images
+MAX_IMAGES_PER_CHUNK = 25                     # safety cap regardless of size
 SYSTEM_PROMPT = """\
 You are a procurement-workflow analyst at Fragment. You will be shown a
 chronological session of one employee's screen activity: a structured event
@@ -190,35 +186,18 @@ def _select_images(
 
 
 def _image_block(event: Event, screens_root: Path) -> dict | None:
-    """Resize + JPEG-encode the screenshot for the Anthropic request.
-
-    Full-res PNGs are too large for the 32 MB per-request cap once you have
-    20+ frames. 1280px JPEG q=80 keeps text and UI elements readable while
-    shrinking each frame to ~50-150 KB.
-    """
-    # Normalize backslashes to forward slashes so paths stored on Windows
-    # still resolve on POSIX (and remain valid on Windows).
-    rel = event.screenshot_path.replace("\\", "/")
+    """Encode the screenshot as a base64 PNG content block. Full quality."""
+    rel = event.screenshot_path.replace("\\", "/")  # Win/POSIX portability
     p = screens_root / rel
     if not p.exists():
         log.warning("screenshot missing: %s", p)
         return None
-    try:
-        with Image.open(p) as im:
-            im = im.convert("RGB")
-            im.thumbnail((IMAGE_RESIZE_MAX_PX, IMAGE_RESIZE_MAX_PX), Image.LANCZOS)
-            buf = io.BytesIO()
-            im.save(buf, format="JPEG", quality=IMAGE_JPEG_QUALITY, optimize=True)
-            jpeg_bytes = buf.getvalue()
-    except Exception:  # noqa: BLE001
-        log.exception("failed to resize %s; skipping image", p)
-        return None
-    data = base64.b64encode(jpeg_bytes).decode("ascii")
+    data = base64.b64encode(p.read_bytes()).decode("ascii")
     return {
         "type": "image",
         "source": {
             "type": "base64",
-            "media_type": "image/jpeg",
+            "media_type": "image/png",
             "data": data,
         },
     }
@@ -229,30 +208,119 @@ def build_batch(
     screens_root: Path,
     budget_tokens: int = DEFAULT_BUDGET,
 ) -> Batch:
-    """Compose a Batch ready to be sent as ``messages`` content to Claude."""
+    """Single-batch convenience wrapper — collapses all chunks into one batch.
+
+    Useful for tests and small sessions. For real sessions prefer
+    ``build_batches`` which splits into chunks under Anthropic's 32 MB cap.
+    """
+    chunks = build_batches(events, screens_root, budget_tokens)
+    if not chunks:
+        return Batch(system=SYSTEM_PROMPT, event_log_text=_event_log_table(events))
+    if len(chunks) == 1:
+        return chunks[0]
+    # Merge — used only by tests; production calls build_batches and iterates.
+    merged = Batch(
+        system=SYSTEM_PROMPT,
+        event_log_text=chunks[0].event_log_text,
+        images=[],
+        selected_frame_ids=[],
+        dropped_frame_ids=[],
+        approx_input_tokens=0,
+    )
+    for c in chunks:
+        merged.images.extend(c.images)
+        merged.selected_frame_ids.extend(c.selected_frame_ids)
+        merged.dropped_frame_ids.extend(c.dropped_frame_ids)
+        merged.approx_input_tokens += c.approx_input_tokens
+    return merged
+
+
+def build_batches(
+    events: list[Event],
+    screens_root: Path,
+    budget_tokens: int = DEFAULT_BUDGET,
+) -> list[Batch]:
+    """Split a session into one or more Batches that each fit Anthropic's cap.
+
+    Each returned Batch contains:
+      - the FULL event log of the whole session (cheap text, always include)
+      - a contiguous slice of images
+    Chunking is by accumulated base64 size and by image count cap.
+    """
+    if not events:
+        return []
+
     event_log = _event_log_table(events)
     overhead = len(SYSTEM_PROMPT) // 3 + len(event_log) // 3 + 2_000
 
-    selected, dropped = _select_images(events, screens_root, budget_tokens, overhead)
-
-    images: list[dict] = []
-    selected_ids: list[str] = []
-    for e in selected:
-        # Annotate frame with a small text marker before the image so
-        # Claude can reliably cite frame_ids in its output.
-        images.append({"type": "text", "text": f"frame_id={e.event_id} ts={e.ts.isoformat(timespec='seconds')}"})
+    # Build raw image blocks once (PIL/base64 happens here), then chunk
+    image_records: list[tuple[Event, dict, dict, int]] = []
+    for e in events:
         block = _image_block(e, screens_root)
         if block is None:
             continue
-        images.append(block)
-        selected_ids.append(e.event_id)
+        marker = {
+            "type": "text",
+            "text": f"frame_id={e.event_id} ts={e.ts.isoformat(timespec='seconds')}",
+        }
+        # base64 payload byte size approximates the on-the-wire cost
+        size_bytes = len(block["source"]["data"])
+        image_records.append((e, marker, block, size_bytes))
 
-    approx = overhead + len(selected_ids) * APPROX_TOKENS_PER_IMAGE
-    return Batch(
-        system=SYSTEM_PROMPT,
-        event_log_text=event_log,
-        images=images,
-        selected_frame_ids=selected_ids,
-        dropped_frame_ids=[d.event_id for d in dropped],
-        approx_input_tokens=approx,
+    if not image_records:
+        return [
+            Batch(
+                system=SYSTEM_PROMPT,
+                event_log_text=event_log,
+                images=[],
+                selected_frame_ids=[],
+                dropped_frame_ids=[ev.event_id for ev in events],
+                approx_input_tokens=overhead,
+            )
+        ]
+
+    batches: list[Batch] = []
+    cur_images: list[dict] = []
+    cur_ids: list[str] = []
+    cur_bytes = 0
+
+    def _flush() -> None:
+        nonlocal cur_images, cur_ids, cur_bytes
+        if not cur_ids:
+            return
+        batches.append(
+            Batch(
+                system=SYSTEM_PROMPT,
+                event_log_text=event_log,
+                images=cur_images,
+                selected_frame_ids=cur_ids,
+                dropped_frame_ids=[],
+                approx_input_tokens=overhead + len(cur_ids) * APPROX_TOKENS_PER_IMAGE,
+            )
+        )
+        cur_images = []
+        cur_ids = []
+        cur_bytes = 0
+
+    for ev, marker, block, size_bytes in image_records:
+        # If adding this image would blow the chunk, flush first.
+        would_overflow = (
+            cur_bytes + size_bytes > MAX_CHUNK_PAYLOAD_BYTES
+            or len(cur_ids) >= MAX_IMAGES_PER_CHUNK
+        )
+        if would_overflow and cur_ids:
+            _flush()
+        cur_images.append(marker)
+        cur_images.append(block)
+        cur_ids.append(ev.event_id)
+        cur_bytes += size_bytes
+
+    _flush()
+
+    log.info(
+        "split %d images into %d batch(es); sizes: %s",
+        len(image_records),
+        len(batches),
+        [f"{len(b.selected_frame_ids)} images" for b in batches],
     )
+    return batches
