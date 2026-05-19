@@ -83,7 +83,15 @@ class Store:
         self.screens_dir = self.root / "screens"
         self.screens_dir.mkdir(exist_ok=True)
         self.db_path = self.root / "events.db"
-        self._conn = sqlite3.connect(self.db_path, isolation_level=None)
+        # check_same_thread=False: the daemon writes from its worker thread
+        # while live-mode's renderer reads from a separate thread. Python's
+        # sqlite3 module serializes operations on a single connection via a
+        # per-connection mutex, so cross-thread use is safe here.
+        # WAL journal mode lets readers continue while a writer holds a lock.
+        self._conn = sqlite3.connect(
+            self.db_path, isolation_level=None, check_same_thread=False
+        )
+        self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_DDL)
 
     # -- events ------------------------------------------------------------
