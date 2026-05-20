@@ -41,6 +41,9 @@ MAX_IMAGES_PER_CHUNK = 12                     # safety cap regardless of size
 # only down-encode images that exceed this — smaller PNGs pass through
 # at full quality.
 MAX_PER_IMAGE_BYTES = 4 * 1024 * 1024
+# And for multi-image requests, each image's largest dimension must be
+# <= 2000 px. We resize anything that exceeds this regardless of file size.
+MAX_IMAGE_DIMENSION_PX = 2000
 SYSTEM_PROMPT = """\
 You are a procurement-workflow analyst at Fragment. You will be shown a
 chronological session of one employee's screen activity: a structured event
@@ -197,36 +200,39 @@ def _select_images(
 
 
 def _shrink_for_anthropic(path: Path) -> tuple[bytes, str]:
-    """If the screenshot exceeds the per-image cap, shrink it; otherwise
-    return the raw PNG bytes. Tries progressively smaller resolutions
-    and JPEG qualities until the result fits."""
+    """Resize/encode the screenshot to fit Anthropic's limits.
+
+    Anthropic imposes two image constraints we have to respect:
+      - per-image raw size <= 5 MB
+      - for many-image requests: max dimension <= 2000 px
+    PNGs below both thresholds pass through full-quality; otherwise we
+    re-encode as JPEG, picking the largest dimension that fits.
+    """
     raw = path.read_bytes()
-    if len(raw) <= MAX_PER_IMAGE_BYTES:
+    with Image.open(path) as im:
+        w, h = im.width, im.height
+
+    over_size = len(raw) > MAX_PER_IMAGE_BYTES
+    over_dim = max(w, h) > MAX_IMAGE_DIMENSION_PX
+    if not (over_size or over_dim):
         return raw, "image/png"
 
     with Image.open(path) as im:
         im = im.convert("RGB")
-        original_size = (im.width, im.height)
-        for max_px in (2048, 1600, 1280, 960, 720):
+        for max_px in (MAX_IMAGE_DIMENSION_PX - 100, 1600, 1280, 960, 720):
             for quality in (90, 80, 70):
                 im2 = im.copy()
                 im2.thumbnail((max_px, max_px), Image.LANCZOS)
                 buf = io.BytesIO()
                 im2.save(buf, format="JPEG", quality=quality, optimize=True)
-                if buf.tell() <= MAX_PER_IMAGE_BYTES:
+                if buf.tell() <= MAX_PER_IMAGE_BYTES and max(im2.size) <= MAX_IMAGE_DIMENSION_PX:
                     log.info(
-                        "compressed %s: %dx%d PNG %d KB -> JPEG q=%d %dpx %d KB",
-                        path.name,
-                        *original_size,
-                        len(raw) // 1024,
-                        quality,
-                        max_px,
-                        buf.tell() // 1024,
+                        "resized %s: %dx%d PNG %d KB -> JPEG q=%d %dx%d %d KB",
+                        path.name, w, h, len(raw) // 1024,
+                        quality, im2.width, im2.height, buf.tell() // 1024,
                     )
                     return buf.getvalue(), "image/jpeg"
-    # Last resort — return whatever the smallest attempt produced, even
-    # if it's still over (Anthropic will reject; let caller surface).
-    log.warning("could not shrink %s under cap; returning best effort", path)
+    log.warning("could not shrink %s under caps; returning best effort", path)
     return buf.getvalue(), "image/jpeg"
 
 
