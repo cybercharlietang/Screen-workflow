@@ -35,7 +35,10 @@ DEFAULT_BUDGET = 400_000  # leave headroom below 500K for response generation
 # and give Claude more discrete mental-model-update steps. Tune up if
 # rate-limited / latency-sensitive on larger sessions.
 MAX_CHUNK_PAYLOAD_BYTES = 10 * 1024 * 1024   # ~10 MB of base64-encoded images
-MAX_IMAGES_PER_CHUNK = 12                     # safety cap regardless of size
+# Anthropic's "many-image request" 2000px-per-side rule appears to kick in
+# above ~8-10 images per call. Staying under that lets us keep most
+# screenshots at full PNG resolution. Tune up only if rate-limited.
+MAX_IMAGES_PER_CHUNK = 6
 
 # Anthropic also caps EACH image at 5 MB. We give ourselves headroom and
 # only down-encode images that exceed this — smaller PNGs pass through
