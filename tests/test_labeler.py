@@ -73,14 +73,11 @@ class TestBatch:
             events.append(_event(i))
             _png(screens / f"x_{i}.png")
         batches = build_batches(events, screens)
-        # We should have at least 3 batches because we exceed 2× the image cap.
         assert len(batches) >= 3
-        # All images present across batches; no dropping.
         all_ids = []
         for b in batches:
             all_ids.extend(b.selected_frame_ids)
         assert sorted(all_ids) == sorted(e.event_id for e in events)
-        # Each batch holds at most MAX_IMAGES_PER_CHUNK.
         for b in batches:
             assert len(b.selected_frame_ids) <= MAX_IMAGES_PER_CHUNK
 

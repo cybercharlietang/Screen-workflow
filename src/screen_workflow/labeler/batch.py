@@ -31,8 +31,11 @@ DEFAULT_BUDGET = 400_000  # leave headroom below 500K for response generation
 # (no compression — pixel detail matters for OCR + UI element reading) and
 # split sessions into multiple chunks if the total payload would overflow.
 # Conservative budget per-chunk leaves headroom for the prompt + JSON output.
-MAX_CHUNK_PAYLOAD_BYTES = 20 * 1024 * 1024   # ~20 MB of base64-encoded images
-MAX_IMAGES_PER_CHUNK = 25                     # safety cap regardless of size
+# Smaller chunks are faster per-call, fail more cheaply if one errors,
+# and give Claude more discrete mental-model-update steps. Tune up if
+# rate-limited / latency-sensitive on larger sessions.
+MAX_CHUNK_PAYLOAD_BYTES = 10 * 1024 * 1024   # ~10 MB of base64-encoded images
+MAX_IMAGES_PER_CHUNK = 12                     # safety cap regardless of size
 
 # Anthropic also caps EACH image at 5 MB. We give ourselves headroom and
 # only down-encode images that exceed this — smaller PNGs pass through
