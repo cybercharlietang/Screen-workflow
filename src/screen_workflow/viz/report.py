@@ -56,6 +56,8 @@ def _img_data_uri(path: Path) -> str:
 
 
 def _event_dict(e: Event, screens_root: Path) -> dict:
+    # Normalize Windows backslashes so the URL works in the browser.
+    posix_rel = e.screenshot_path.replace("\\", "/")
     return {
         "event_id": e.event_id,
         "ts": _ts(e.ts),
@@ -67,7 +69,9 @@ def _event_dict(e: Event, screens_root: Path) -> dict:
         "target_label": e.trigger.target_label,
         "ocr_text": e.ocr_text,
         "ui_elements": [u.model_dump() for u in e.ui_elements],
-        "screenshot": _img_data_uri(screens_root / e.screenshot_path),
+        # Thumbnail inline for the table; full image via the /screens/ route.
+        "screenshot": _img_data_uri(screens_root / posix_rel),
+        "screenshot_url": f"/screens/{posix_rel}",
     }
 
 
@@ -274,8 +278,9 @@ __AUTO_REFRESH__
   tr.event-row { cursor: pointer; }
   tr.event-row:hover { background: #f9f9f9; }
   tr.event-row.selected { background: #fff8dc; }
-  .detail { display: flex; gap: 20px; margin-top: 16px; }
-  .detail img { max-width: 60%; border: 1px solid #ddd; background: #fff; }
+  .detail { display: flex; gap: 20px; margin-top: 16px; align-items: flex-start; }
+  .detail a { display: block; flex: 0 0 70%; }
+  .detail img { width: 100%; border: 1px solid #ddd; background: #fff; cursor: zoom-in; }
   .detail .meta { flex: 1; font-size: 13px; }
   .detail .meta dt { font-weight: 600; margin-top: 8px; color: #555; }
   .detail .meta dd { margin: 0; }
@@ -480,9 +485,14 @@ function render(data) {
     row.classList.add('selected');
     const e = data.events[i];
     const det = document.getElementById('event-detail');
+    // Use the full-resolution image from the /screens/ route on click,
+    // falling back to the inline thumbnail if the file isn't reachable.
+    const fullSrc = e.screenshot_url || e.screenshot || '';
     det.innerHTML = `
       <div class="detail">
-        <img src="${e.screenshot || ''}" alt="screenshot" />
+        <a href="${fullSrc}" target="_blank" title="open full-size in new tab">
+          <img src="${fullSrc}" alt="screenshot" onerror="this.src='${e.screenshot || ''}'" />
+        </a>
         <div class="meta">
           <dl>
             <dt>event_id</dt><dd>${escapeHtml(e.event_id)}</dd>

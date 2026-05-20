@@ -42,20 +42,33 @@ def _rerender_loop(root: Path, out_dir: Path, stop: threading.Event) -> None:
         stop.wait(RERENDER_INTERVAL_SECONDS)
 
 
-def _serve(out_dir: Path, port: int, stop: threading.Event) -> None:
-    """Tiny HTTP server with a meta-refresh injected so the browser auto-reloads."""
+def _serve(out_dir: Path, screens_dir: Path, port: int, stop: threading.Event) -> None:
+    """Local HTTP server.
+
+    Routes:
+      /              -> out_dir (index.html, data.json)
+      /screens/...   -> screens_dir (full-resolution PNGs, lazy-loaded by
+                        the page's event detail view)
+    """
 
     class Handler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *args, **kw):
             super().__init__(*args, directory=str(out_dir), **kw)
 
+        def translate_path(self, path: str) -> str:
+            # Route /screens/... to the captures directory.
+            if path.startswith("/screens/"):
+                rel = path[len("/screens/") :].split("?", 1)[0].split("#", 1)[0]
+                # Strip any leading slashes/backslashes for safety
+                rel = rel.lstrip("/\\")
+                return str(screens_dir / rel)
+            return super().translate_path(path)
+
         def end_headers(self):
-            # Bust the browser cache so each refresh picks up the new HTML.
             self.send_header("Cache-Control", "no-store, max-age=0")
             super().end_headers()
 
         def log_message(self, fmt, *args):
-            # quieter logs
             pass
 
     socketserver.TCPServer.allow_reuse_address = True
@@ -101,8 +114,9 @@ def main(argv: list[str] | None = None) -> int:
     rerender_thread = threading.Thread(
         target=_rerender_loop, args=(root, out_dir, stop), daemon=True
     )
+    screens_dir = root / "screens"
     server_thread = threading.Thread(
-        target=_serve, args=(out_dir, args.port, stop), daemon=True
+        target=_serve, args=(out_dir, screens_dir, args.port, stop), daemon=True
     )
     daemon_thread.start()
     rerender_thread.start()
