@@ -4,6 +4,32 @@ Phase-organized backlog. Move items between phases as priorities shift; do
 not delete completed items (we want the historical trace) — strike them or
 move under a "Done" section per phase.
 
+## Status as of 2026-05-19: PoC COMPLETE ✓
+
+End-to-end pipeline working: capture → segment → label → workflow graph
+→ viz. Real demo session produced "Monitor purchase recommendation"
+workflow (6 nodes, ~$0.80 in API cost for 10 min of activity). 58 tests
+passing. See `docs/prompts.md` for the active Claude prompts and
+`LESSONS.md` § L9–L16 for what we learned along the way.
+
+### Next 3 steps for whoever picks this up
+
+1. **Annotator validation pass.** Run the hand-labeled gold-output
+   workflows (your colleague's parallel work, see `docs/annotation_prompt.md`)
+   through the labeler. Compute per-class agreement (Cohen's κ ≥ 0.7
+   target). Use disagreements to tune the system prompt in
+   `labeler/api.py:SYSTEM_PROMPT`.
+2. **HITL review queue.** Build a simple "Review" tab in the viz that
+   lists workflows nearing or at the stability threshold
+   (`is_complete=True`). Approve/reject button writes back to the DB.
+   The flagging mechanism is already in place — needs a UI.
+3. **Token-estimate calibration.** Write `bench/agent_cost_calibration.py`
+   that runs a real agent against 3 canonical actions per CAGE class
+   (Capture/Analyze/Generate/Extract) and produces a
+   `tokens_per_action[cage_label]` mean/variance table. Replace Claude's
+   per-action estimates with this calibrated lookup for defensible cost
+   numbers.
+
 ## PoC scope (today, ~5–6 h budget)
 
 Hard cuts to fit a one-day proof of concept:
@@ -142,6 +168,27 @@ Sub-package: `src/screen_workflow/analytics/`.
 - [ ] One-employee pilot for one week. Iterate taxonomy and prompts on
       real data.
 - [ ] Per-employee opt-in UX + visible on/off control on the daemon.
+
+## Production hardening (deferred from PoC)
+
+These were intentionally cut for PoC scope. Revisit when going to pilot:
+
+- [ ] SQLCipher + DPAPI encryption of `events.db` and `screens/*.png`.
+- [ ] Local OCR + UI Automation tree per frame (vs. relying on Claude
+      to OCR each screenshot every call).
+- [ ] Browser extension for URL fidelity (currently window title only).
+- [ ] Prompt caching with Anthropic's prompt-cache feature on the
+      workflow directory (saves money once the directory grows).
+- [ ] Configurable image quality: a `--compress` flag on the labeler to
+      pre-shrink screenshots before sending (trade fidelity for cost at
+      scale).
+- [ ] Cross-platform daemon (macOS + Linux), pyobjc Accessibility +
+      AT-SPI bindings.
+- [ ] Redaction list signed off with legal (deferred since PoC ran on
+      internal data only).
+- [ ] Auto-routing improvements: today the labeler relies on Claude
+      naming workflows; with many workflows in the directory the
+      summaries should be cached or chunked.
 
 ## Open questions
 

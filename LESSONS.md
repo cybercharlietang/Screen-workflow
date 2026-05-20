@@ -145,6 +145,161 @@ likely already solved the obvious mistakes.
 
 ---
 
+## L9 — WSL2 port-forwarding bleeds local servers to Windows
+
+**Rule.** A process bound to `localhost:PORT` inside WSL2 is reachable
+from the Windows host's browser at the same `localhost:PORT`. If a
+Windows process also tries to bind that port, the result is
+unpredictable — the browser might hit either one.
+
+**Why.** During this PoC, a WSL demo server on `:8765` was answering the
+user's Windows browser requests for ~30 min while their Windows daemon
+was running on the same port. Symptoms: the page showed "demo" data the
+user didn't recognize, the Daemon status badge said "no status file"
+(because demo data has no `_status.json`).
+
+**How to apply.** Whenever running an HTTP server in WSL for testing,
+kill it before the user starts their Windows-side equivalent. Or use
+non-overlapping ports.
+
+---
+
+## L10 — Chrome ignores meta-refresh + no-store on localhost
+
+**Rule.** `<meta http-equiv="refresh">` plus `Cache-Control: no-store` is
+NOT sufficient to make a localhost page reliably reload with fresh
+content. The page may serve stale HTML, tabs flicker mid-click,
+hash-based tab state gets reset unpredictably.
+
+**Why.** Several browsers (notably Chrome) have aggressive caching
+heuristics for localhost that ignore standard cache headers.
+
+**How to apply.** For "live" pages on localhost, use **fetch-polling**
+instead: serve a small stable shell HTML and a separate `data.json`;
+poll `data.json` via `fetch()` with `cache: 'no-store'` and a cache-bust
+`?_t=Date.now()` query param. Update DOM in place. The page never
+reloads, so tab state, scroll position, etc. all persist trivially.
+
+---
+
+## L11 — Anthropic vision API has stricter limits than the docs suggest
+
+**Rule.** Real limits encountered in this PoC:
+
+- Total request: 32 MB
+- Per-image raw size: 5 MB
+- **Per-image dimension for "multi-image requests": 2000 px per side**
+  (undocumented as of our session)
+- Single-image requests appear to allow up to 8000×8000 px per docs
+- Max 100 images per request per docs
+
+**Why.** We hit each limit in turn:
+
+- 413 Payload Too Large at ~100 MB total
+- `image exceeds 5 MB maximum: 14582212 bytes`
+- `At least one of the image dimensions exceed max allowed size for many-image requests: 2000 pixels`
+
+**How to apply.** Keep chunks small (≤ 6 images per request was empirically
+fine) so the 2000 px multi-image rule doesn't trigger. Compress images
+in this order to minimize pixel loss: (a) leave raw PNG ≤ 5 MB
+untouched, (b) JPEG at original dimensions, decreasing quality, (c)
+last resort, resize.
+
+---
+
+## L12 — The workflow graph IS the artifact, not per-session labels
+
+**Rule.** The output of the project is a directed graph where each unique
+*action* is one node (with CAGE label, observation count, token estimate).
+Repeated instances across sessions collapse into the same node. Per-session
+label dumps are intermediate noise.
+
+**Why.** User feedback partway through: "we want a mapping of resources,
+action goal and starting point — the agent doesn't have to do exact same
+actions, it just needs to understand the problem, the resources, and the
+final goal." Per-screenshot classification was the wrong target.
+
+**How to apply.** The workflow has *both* a graph (evidence: nodes,
+edges, observation counts, token estimates) AND a goal-oriented summary
+(goal / resources / trigger fields). The summary is the product output
+for an automating agent; the graph is the backing evidence that makes
+the cost estimate defensible.
+
+---
+
+## L13 — Per-action workflow routing, not per-session
+
+**Rule.** Route each cognitive *action* to a workflow independently —
+existing workflow, new workflow, or noise. A single session can
+contribute observations to multiple workflows simultaneously.
+
+**Why.** Real employee sessions interleave tasks: vendor research →
+Slack interruption → invoice question → back to vendor research. Forcing
+a session-level routing decision either over-merges or loses signal.
+
+**How to apply.** Output schema gives each action its own
+`target_workflow_kind = existing | new | noise`. Noise actions are
+counted but not stored as observations. Multi-workflow sessions get the
+workflow store touched in multiple places per Claude call.
+
+---
+
+## L14 — Stability detector is a cheap HITL trigger
+
+**Rule.** A workflow is "ready for human review" when N consecutive
+update calls (default 20) add no new node or edge — only increment
+observation counts on existing ones. The structure has converged.
+
+**Why.** You don't want to require human review on every call (too
+expensive). You also don't want to ship an unreviewed workflow as
+"complete" (too risky). The stability count is the cheap heuristic
+that says "this workflow has settled".
+
+**How to apply.** Workflow gains `stable_observations` and
+`stability_threshold`. Increment on structurally-noop calls, reset on
+structural changes. When ≥ threshold, set `is_complete=True` and queue
+for HITL.
+
+---
+
+## L15 — Browser-side page weight is a hidden tab-killer
+
+**Rule.** A 134 MB self-contained HTML (full PNGs base64-inlined) will
+*appear* to break tabs, freeze the page, and ignore clicks — even when
+the JS is syntactically valid and the renderer is updating the file.
+Chrome silently struggles to parse multi-hundred-MB inline scripts.
+
+**Why.** During this PoC the user spent significant time thinking the
+viz was broken; root cause was inlined base64 image weight. Symptom of
+"tabs not clickable" is much more often "page too heavy to be interactive"
+than "JS error".
+
+**How to apply.** Always split data into a separate JSON file the page
+fetches lazily. Inline only what's tiny (event metadata + thumbnails).
+Serve full-resolution images via a route the browser pulls on demand
+(`/screens/<path>`). Target ~20-50 KB for the shell HTML.
+
+---
+
+## L16 — Real cost data for PoC scale
+
+**Rule.** Per Opus 4.7 pricing (~$15/M input, $75/M output) the labeler
+costs about **$0.80 per 10-minute employee session**. Linear
+extrapolation: **~$30/employee/workday** at scale.
+
+**Why.** Calibration data from our actual run: ~30K input + ~4K output
+tokens for a 64-event procurement session ≈ $0.80. Multiple noise-only
+sessions cost ~$0.50 each (system prompt overhead dominates).
+
+**How to apply.** PoC scale is fine to leave at full quality. For
+production with many employees × full days, the cost trade-offs to
+revisit are: (a) JPEG compression of screenshots before sending, (b)
+caching the workflow directory in the system prompt with Anthropic's
+prompt-caching feature, (c) sending only event metadata + a few
+representative screenshots per session instead of all frames.
+
+---
+
 ## L7 — "What is PII vs. what is signal" is a project-viability question
 
 **Rule.** Vendor names, PO numbers, GL codes, dollar amounts are the

@@ -203,27 +203,43 @@ def _select_images(
 
 
 def _shrink_for_anthropic(path: Path) -> tuple[bytes, str]:
-    """Resize/encode the screenshot to fit Anthropic's limits.
+    """Encode the screenshot to fit Anthropic's limits with minimum pixel loss.
 
-    Anthropic imposes two image constraints we have to respect:
-      - per-image raw size <= 5 MB
-      - for many-image requests: max dimension <= 2000 px
-    PNGs below both thresholds pass through full-quality; otherwise we
-    re-encode as JPEG, picking the largest dimension that fits.
+    Strategy (in order — preserve resolution as long as possible):
+      1. Raw PNG, if under both 5 MB and (only when batch is "many-image")
+         the 2000 px dimension cap.
+      2. JPEG at original dimensions, decreasing quality (95 → 80) until
+         <= 5 MB. Preserves spatial resolution; only loses some quality.
+      3. JPEG with progressive downscaling, last resort.
+
+    The 2000 px cap only matters if the batch will be "many-image". We
+    don't know the threshold exactly, but it's around ~10 images. The
+    chunker keeps us under that, so we only enforce the dimension cap
+    when we already need to compress for size anyway.
     """
     raw = path.read_bytes()
     with Image.open(path) as im:
         w, h = im.width, im.height
 
-    over_size = len(raw) > MAX_PER_IMAGE_BYTES
-    over_dim = max(w, h) > MAX_IMAGE_DIMENSION_PX
-    if not (over_size or over_dim):
-        return raw, "image/png"
+    if len(raw) <= MAX_PER_IMAGE_BYTES:
+        return raw, "image/png"  # full PNG — preferred path
 
+    # Step 2: JPEG at original size, decreasing quality.
     with Image.open(path) as im:
         im = im.convert("RGB")
+        for quality in (95, 90, 85, 80):
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=quality, optimize=True)
+            if buf.tell() <= MAX_PER_IMAGE_BYTES:
+                log.info(
+                    "compressed %s: %dx%d PNG %d KB -> JPEG q=%d (same size) %d KB",
+                    path.name, w, h, len(raw) // 1024, quality, buf.tell() // 1024,
+                )
+                return buf.getvalue(), "image/jpeg"
+
+        # Step 3: progressive downscale + JPEG. Hits the dim cap too.
         for max_px in (MAX_IMAGE_DIMENSION_PX - 100, 1600, 1280, 960, 720):
-            for quality in (90, 80, 70):
+            for quality in (90, 85, 80, 70):
                 im2 = im.copy()
                 im2.thumbnail((max_px, max_px), Image.LANCZOS)
                 buf = io.BytesIO()
@@ -235,6 +251,7 @@ def _shrink_for_anthropic(path: Path) -> tuple[bytes, str]:
                         quality, im2.width, im2.height, buf.tell() // 1024,
                     )
                     return buf.getvalue(), "image/jpeg"
+
     log.warning("could not shrink %s under caps; returning best effort", path)
     return buf.getvalue(), "image/jpeg"
 

@@ -1,7 +1,37 @@
 # Screen-workflow — Specification
 
-Status: draft v0.1 — pre-implementation. Update this file when architecture
-changes; do not let code and spec drift.
+Status: **v1.0 — PoC complete** (2026-05-19). This file reflects the
+architecture as shipped, not the original design (which differed in
+several material ways — noted inline where the implementation diverged).
+Update when architecture changes; do not let code and spec drift.
+
+## Implementation notes (vs. original design)
+
+The shipped system differs from the v0.1 spec on three fronts:
+
+1. **The artifact.** Original plan: per-session lists of CAGE-labeled
+   "actions" with start/end timestamps + complexity tier. Shipped:
+   a **workflow graph** per workflow (unique nodes with observation
+   counts, edges with transition counts) plus a goal-oriented summary
+   (goal / resources / trigger). Per-session label dumps are no longer
+   stored; instead `Observation` rows record which frames mapped to
+   which node. See `LESSONS.md` § L12.
+
+2. **Routing.** Original plan: one session = one workflow (manual
+   `--workflow` flag). Shipped: **per-action routing** — each cognitive
+   action is independently routed to an existing workflow, a new
+   workflow (Claude names it), or noise. A session can contribute to
+   multiple workflows simultaneously. See `LESSONS.md` § L13.
+
+3. **Labeling structure.** Original plan: two-pass (segment then
+   classify). Shipped: single-pass per chunk, multiple chunks per
+   session if needed (each chunk ≤ 6 images / ≤ 10 MB to stay under
+   Anthropic's per-image and per-request caps). The workflow graph
+   itself acts as the cross-call mental model — each chunk's Claude
+   call sees the directory of workflows built up by previous chunks.
+
+Cost data from the demo run (Opus 4.7): ~$0.80 per 10-min employee
+session. ~$30/employee/day extrapolation at scale.
 
 ---
 
