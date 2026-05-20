@@ -13,9 +13,12 @@ typical 1080p screenshot at default detail).
 from __future__ import annotations
 
 import base64
+import io
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from PIL import Image
 
 from screen_workflow.schemas import Event
 
@@ -30,6 +33,11 @@ DEFAULT_BUDGET = 400_000  # leave headroom below 500K for response generation
 # Conservative budget per-chunk leaves headroom for the prompt + JSON output.
 MAX_CHUNK_PAYLOAD_BYTES = 20 * 1024 * 1024   # ~20 MB of base64-encoded images
 MAX_IMAGES_PER_CHUNK = 25                     # safety cap regardless of size
+
+# Anthropic also caps EACH image at 5 MB. We give ourselves headroom and
+# only down-encode images that exceed this — smaller PNGs pass through
+# at full quality.
+MAX_PER_IMAGE_BYTES = 4 * 1024 * 1024
 SYSTEM_PROMPT = """\
 You are a procurement-workflow analyst at Fragment. You will be shown a
 chronological session of one employee's screen activity: a structured event
@@ -185,19 +193,62 @@ def _select_images(
     return selected, dropped
 
 
+def _shrink_for_anthropic(path: Path) -> tuple[bytes, str]:
+    """If the screenshot exceeds the per-image cap, shrink it; otherwise
+    return the raw PNG bytes. Tries progressively smaller resolutions
+    and JPEG qualities until the result fits."""
+    raw = path.read_bytes()
+    if len(raw) <= MAX_PER_IMAGE_BYTES:
+        return raw, "image/png"
+
+    with Image.open(path) as im:
+        im = im.convert("RGB")
+        original_size = (im.width, im.height)
+        for max_px in (2048, 1600, 1280, 960, 720):
+            for quality in (90, 80, 70):
+                im2 = im.copy()
+                im2.thumbnail((max_px, max_px), Image.LANCZOS)
+                buf = io.BytesIO()
+                im2.save(buf, format="JPEG", quality=quality, optimize=True)
+                if buf.tell() <= MAX_PER_IMAGE_BYTES:
+                    log.info(
+                        "compressed %s: %dx%d PNG %d KB -> JPEG q=%d %dpx %d KB",
+                        path.name,
+                        *original_size,
+                        len(raw) // 1024,
+                        quality,
+                        max_px,
+                        buf.tell() // 1024,
+                    )
+                    return buf.getvalue(), "image/jpeg"
+    # Last resort — return whatever the smallest attempt produced, even
+    # if it's still over (Anthropic will reject; let caller surface).
+    log.warning("could not shrink %s under cap; returning best effort", path)
+    return buf.getvalue(), "image/jpeg"
+
+
 def _image_block(event: Event, screens_root: Path) -> dict | None:
-    """Encode the screenshot as a base64 PNG content block. Full quality."""
+    """Encode the screenshot as a base64 image content block.
+
+    Full-quality PNG by default; auto-compresses if the original would
+    exceed Anthropic's per-image 5 MB cap.
+    """
     rel = event.screenshot_path.replace("\\", "/")  # Win/POSIX portability
     p = screens_root / rel
     if not p.exists():
         log.warning("screenshot missing: %s", p)
         return None
-    data = base64.b64encode(p.read_bytes()).decode("ascii")
+    try:
+        img_bytes, media_type = _shrink_for_anthropic(p)
+    except Exception:  # noqa: BLE001
+        log.exception("failed to encode %s", p)
+        return None
+    data = base64.b64encode(img_bytes).decode("ascii")
     return {
         "type": "image",
         "source": {
             "type": "base64",
-            "media_type": "image/png",
+            "media_type": media_type,
             "data": data,
         },
     }
