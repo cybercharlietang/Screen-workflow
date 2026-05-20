@@ -178,9 +178,10 @@ def render(
     out_dir.mkdir(parents=True, exist_ok=True)
     all_events = list(store.iter_events(session_id))
     total_events = len(all_events)
-    # Cap to most-recent N to keep the HTML page responsive.
     if total_events > MAX_EVENTS_RENDERED:
         all_events = all_events[-MAX_EVENTS_RENDERED:]
+    # Newest first in the Events tab.
+    all_events.reverse()
     events = [_event_dict(e, store.screens_dir) for e in all_events]
     sessions = [_session_dict(s) for s in store.iter_sessions()]
     workflows = [_workflow_dict(w) for w in store.iter_workflows()]
@@ -352,6 +353,23 @@ __AUTO_REFRESH__
 const POLL_INTERVAL_MS = 3000;
 let currentData = null;
 
+// Format any ISO timestamp as Pacific time (America/Los_Angeles).
+const _PACIFIC_FMT = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/Los_Angeles',
+  year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit',
+  hour12: false,
+});
+function fmtPacific(iso) {
+  if (!iso) return '—';
+  try {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    const parts = _PACIFIC_FMT.formatToParts(d).reduce((a, p) => { a[p.type] = p.value; return a; }, {});
+    return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} PT`;
+  } catch (e) { return iso; }
+}
+
 async function fetchData() {
   try {
     const r = await fetch('data.json?_t=' + Date.now(), { cache: 'no-store' });
@@ -442,7 +460,7 @@ function render(data) {
       l.textContent = '—';
     }
     ev.textContent = s.events_captured != null ? s.events_captured : '—';
-    last.textContent = s.last_event_ts ? s.last_event_ts.substring(11, 19) + ' UTC' : 'never';
+    last.textContent = s.last_event_ts ? fmtPacific(s.last_event_ts) : 'never';
     if (s.last_error) {
       const errDiv = document.createElement('div');
       errDiv.style.cssText = 'background:#b91c1c;color:#fff;padding:6px 10px;font-size:12px;';
@@ -467,7 +485,7 @@ function render(data) {
     tr.dataset.idx = i;
     tr.innerHTML = `
       <td class="num">${i + 1}</td>
-      <td>${escapeHtml(e.ts)}</td>
+      <td>${escapeHtml(fmtPacific(e.ts))}</td>
       <td>${escapeHtml(e.app)}</td>
       <td>${escapeHtml(e.window_title)}</td>
       <td><span class="pill pill-${e.trigger}">${e.trigger}</span></td>
@@ -496,7 +514,7 @@ function render(data) {
         <div class="meta">
           <dl>
             <dt>event_id</dt><dd>${escapeHtml(e.event_id)}</dd>
-            <dt>ts</dt><dd>${escapeHtml(e.ts)}</dd>
+            <dt>ts</dt><dd>${escapeHtml(fmtPacific(e.ts))}</dd>
             <dt>app</dt><dd>${escapeHtml(e.app)}</dd>
             <dt>window_title</dt><dd>${escapeHtml(e.window_title)}</dd>
             <dt>url</dt><dd>${escapeHtml(e.url || '—')}</dd>
@@ -516,8 +534,8 @@ function render(data) {
     stb.innerHTML += `
       <tr>
         <td>${escapeHtml(s.session_id)}</td>
-        <td>${escapeHtml(s.start_ts)}</td>
-        <td>${escapeHtml(s.end_ts)}</td>
+        <td>${escapeHtml(fmtPacific(s.start_ts))}</td>
+        <td>${escapeHtml(fmtPacific(s.end_ts))}</td>
         <td>${escapeHtml(s.close_reason)}</td>
         <td class="num">${s.event_ids.length}</td>
       </tr>`;
@@ -584,7 +602,7 @@ function render(data) {
   data.observations.forEach(o => {
     otb.innerHTML += `
       <tr>
-        <td>${escapeHtml(o.observed_at)}</td>
+        <td>${escapeHtml(fmtPacific(o.observed_at))}</td>
         <td>${escapeHtml(o.node_name)}</td>
         <td><span class="pill pill-${o.cage_label}">${o.cage_label}</span></td>
         <td>${escapeHtml(o.system)}</td>
@@ -613,7 +631,7 @@ function render(data) {
         <div style="background:#fff; border:1px solid #ddd; border-radius:6px; padding:14px; margin-bottom:12px">
           <h3 style="margin:0 0 8px 0; font-size:14px; font-family: ui-monospace, monospace">${escapeHtml(s.session_id)}</h3>
           <div style="font-size:12px; color:#555; margin-bottom:10px">
-            ${escapeHtml(s.start_ts)} → ${escapeHtml(s.end_ts)} · closed by <b>${escapeHtml(s.close_reason)}</b> · ${eventsInSession.length} events
+            ${escapeHtml(fmtPacific(s.start_ts))} → ${escapeHtml(fmtPacific(s.end_ts))} · closed by <b>${escapeHtml(s.close_reason)}</b> · ${eventsInSession.length} events
           </div>`;
       if (a) {
         const sum = a.summary || {};
