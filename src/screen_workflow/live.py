@@ -79,6 +79,9 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Silence chatty third-party loggers even at DEBUG
+    for noisy in ("PIL", "PIL.PngImagePlugin", "PIL.Image", "PIL.TiffImagePlugin"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     root = Path(args.root)
     out_dir = Path(args.out)

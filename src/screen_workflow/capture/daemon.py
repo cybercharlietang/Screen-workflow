@@ -350,6 +350,8 @@ def main() -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    for noisy in ("PIL", "PIL.PngImagePlugin", "PIL.Image", "PIL.TiffImagePlugin"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     Daemon(Path(args.root)).run(seconds=args.seconds)
     return 0
 

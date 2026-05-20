@@ -296,7 +296,7 @@ __AUTO_REFRESH__
 <header>
   <div style="flex:1">
     <h1>__TITLE__</h1>
-    <div class="meta" id="meta-line"></div>
+    <div class="meta" id="meta-line">loading data.json…</div>
   </div>
   <div class="status-card" id="status-card">
     <div class="row"><span class="label">Daemon</span><span class="value" id="status-daemon">—</span></div>
