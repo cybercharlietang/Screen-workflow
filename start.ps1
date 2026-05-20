@@ -16,5 +16,9 @@ if ($Reset) {
     if (Test-Path "viz_output") { Remove-Item -Recurse -Force viz_output }
 }
 
+# Always wipe stale Python bytecode so file edits take effect on next import.
+Get-ChildItem -Path . -Recurse -Filter __pycache__ -Directory -ErrorAction SilentlyContinue |
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
 . .\.venv\Scripts\Activate.ps1
 screen-workflow-live --root .\local_data --seconds $Seconds --verbose
