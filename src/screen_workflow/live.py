@@ -85,6 +85,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--port", type=int, default=8765, help="HTTP server port")
     p.add_argument("--seconds", type=float, default=None, help="auto-stop after N seconds")
     p.add_argument("--no-browser", action="store_true", help="don't auto-open browser")
+    p.add_argument(
+        "--no-daemon",
+        action="store_true",
+        help="viz-only mode: run renderer + HTTP server without capturing",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
@@ -106,11 +111,6 @@ def main(argv: list[str] | None = None) -> int:
     store.close()
 
     stop = threading.Event()
-    daemon = Daemon(root)
-
-    daemon_thread = threading.Thread(
-        target=daemon.run, kwargs={"seconds": args.seconds}, daemon=True
-    )
     rerender_thread = threading.Thread(
         target=_rerender_loop, args=(root, out_dir, stop), daemon=True
     )
@@ -118,16 +118,29 @@ def main(argv: list[str] | None = None) -> int:
     server_thread = threading.Thread(
         target=_serve, args=(out_dir, screens_dir, args.port, stop), daemon=True
     )
-    daemon_thread.start()
     rerender_thread.start()
     server_thread.start()
 
+    daemon = None
+    daemon_thread = None
+    if not args.no_daemon:
+        daemon = Daemon(root)
+        daemon_thread = threading.Thread(
+            target=daemon.run, kwargs={"seconds": args.seconds}, daemon=True
+        )
+        daemon_thread.start()
+
     url = f"http://localhost:{args.port}/"
+    mode = "view-only" if args.no_daemon else "live"
     print()
     print("=" * 60)
-    print(f"  Screen-workflow live  ->  {url}")
-    print(f"  Capturing to:           {root.resolve()}")
-    print(f"  Re-rendering every:     {RERENDER_INTERVAL_SECONDS}s")
+    print(f"  Screen-workflow {mode}  ->  {url}")
+    print(f"  Reading from:            {root.resolve()}")
+    if args.no_daemon:
+        print(f"  Capture daemon:          DISABLED (--no-daemon)")
+    else:
+        print(f"  Capturing to:            {root.resolve()}")
+    print(f"  Re-rendering every:      {RERENDER_INTERVAL_SECONDS}s")
     print("  Press Ctrl+C to stop.")
     print("=" * 60)
     print()
@@ -139,12 +152,17 @@ def main(argv: list[str] | None = None) -> int:
             pass
 
     try:
-        # The daemon thread is the source of truth for "still running".
-        while daemon_thread.is_alive():
-            daemon_thread.join(timeout=0.5)
+        if daemon_thread is not None:
+            while daemon_thread.is_alive():
+                daemon_thread.join(timeout=0.5)
+        else:
+            # view-only: wait until Ctrl+C
+            while not stop.is_set():
+                time.sleep(0.5)
     except KeyboardInterrupt:
         print("\nstopping...")
-        daemon._stop.set()  # noqa: SLF001 — internal stop signal
+        if daemon is not None:
+            daemon._stop.set()  # noqa: SLF001
     finally:
         stop.set()
         time.sleep(0.5)
