@@ -77,6 +77,17 @@ CREATE TABLE IF NOT EXISTS observations (
 );
 CREATE INDEX IF NOT EXISTS idx_obs_workflow ON observations(workflow_id);
 CREATE INDEX IF NOT EXISTS idx_obs_session ON observations(session_id);
+
+CREATE TABLE IF NOT EXISTS api_calls (
+    call_id        TEXT PRIMARY KEY,
+    ts             TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    session_id     TEXT,
+    input_tokens   INTEGER NOT NULL,
+    output_tokens  INTEGER NOT NULL,
+    usd_cost       REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_api_calls_ts ON api_calls(ts);
 """
 
 
@@ -247,6 +258,59 @@ class Store:
                 expected_agent_steps=row[6],
                 confidence=row[7],
                 observed_at=datetime.fromisoformat(row[8]),
+            )
+
+    # -- api calls (cost tracking) -----------------------------------------
+
+    def insert_api_call(
+        self,
+        *,
+        call_id: str,
+        ts: datetime,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        usd_cost: float,
+        session_id: str | None = None,
+    ) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO api_calls VALUES (?,?,?,?,?,?,?)",
+            (
+                call_id,
+                ts.isoformat(),
+                model,
+                session_id,
+                input_tokens,
+                output_tokens,
+                usd_cost,
+            ),
+        )
+
+    def sum_usd_since(self, since_ts: datetime) -> float:
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(usd_cost), 0) FROM api_calls WHERE ts >= ?",
+            (since_ts.isoformat(),),
+        ).fetchone()
+        return float(row[0])
+
+    def sum_usd_total(self) -> float:
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(usd_cost), 0) FROM api_calls"
+        ).fetchone()
+        return float(row[0])
+
+    def iter_api_calls(self) -> Iterator[tuple]:
+        """Yield (call_id, ts, model, session_id, in_toks, out_toks, usd) tuples
+        in chronological order. Light shape — viz only needs the columns."""
+        for row in self._conn.execute("SELECT * FROM api_calls ORDER BY ts"):
+            yield (
+                row[0],
+                datetime.fromisoformat(row[1]),
+                row[2],
+                row[3],
+                int(row[4]),
+                int(row[5]),
+                float(row[6]),
             )
 
     # -- lifecycle ---------------------------------------------------------

@@ -28,7 +28,8 @@ from screen_workflow.viz.report import render
 
 log = logging.getLogger(__name__)
 
-RERENDER_INTERVAL_SECONDS = 3.0
+RERENDER_INTERVAL_SECONDS = 30.0
+DEFAULT_LABELER_MODEL = "claude-sonnet-4-6"
 
 
 def _rerender_loop(root: Path, out_dir: Path, stop: threading.Event) -> None:
@@ -78,6 +79,41 @@ def _serve(out_dir: Path, screens_dir: Path, port: int, stop: threading.Event) -
             httpd.handle_request()
 
 
+def _write_run_metadata(root: Path, args: argparse.Namespace) -> None:
+    """Persist the run's config to local_data/run_metadata.json.
+
+    Future-you looking at a captured run wants to know which knobs produced
+    it without grepping shell history. Cheap, big debuggability win.
+    """
+    import json
+    import subprocess
+    from datetime import datetime, timezone
+
+    try:
+        sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        ).stdout.strip() or None
+    except Exception:  # noqa: BLE001
+        sha = None
+
+    payload = {
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "git_sha": sha,
+        "args": {k: v for k, v in vars(args).items()},
+    }
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "run_metadata.json").write_text(
+            json.dumps(payload, indent=2, default=str), encoding="utf-8"
+        )
+    except OSError:
+        log.exception("failed to write run_metadata.json; continuing")
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="screen_workflow.live")
     p.add_argument("--root", default="./local_data", help="capture storage dir")
@@ -89,6 +125,36 @@ def main(argv: list[str] | None = None) -> int:
         "--no-daemon",
         action="store_true",
         help="viz-only mode: run renderer + HTTP server without capturing",
+    )
+    # Cost guards. The labeler thread (PR 2) reads these via CostMonitor.
+    p.add_argument(
+        "--soft-alert-usd-per-hour",
+        type=float,
+        default=10.0,
+        help="warn when rolling hourly spend hits this",
+    )
+    p.add_argument(
+        "--hard-stop-usd-per-hour",
+        type=float,
+        default=30.0,
+        help="pause labeling when rolling hourly spend hits this; capture continues",
+    )
+    p.add_argument(
+        "--total-spend-cap-usd",
+        type=float,
+        default=100.0,
+        help="pause labeling when cumulative run spend hits this",
+    )
+    # Labeler controls.
+    p.add_argument(
+        "--labeler-model",
+        default=DEFAULT_LABELER_MODEL,
+        help="Anthropic model id for the labeler (sonnet for stress runs, opus for delivery)",
+    )
+    p.add_argument(
+        "--no-labeler",
+        action="store_true",
+        help="capture + segment only; do not call Claude (free dry runs)",
     )
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
@@ -104,6 +170,9 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(args.root)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True)
+
+    _write_run_metadata(root, args)
 
     # Make sure there's at least an empty report so the browser doesn't 404.
     store = Store(root)
@@ -141,6 +210,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(f"  Capturing to:            {root.resolve()}")
     print(f"  Re-rendering every:      {RERENDER_INTERVAL_SECONDS}s")
+    print(f"  Labeler:                 {'DISABLED (--no-labeler)' if args.no_labeler else args.labeler_model}")
+    print(f"  Cost guards:             soft ${args.soft_alert_usd_per_hour}/hr | hard ${args.hard_stop_usd_per_hour}/hr | cap ${args.total_spend_cap_usd}")
     print("  Press Ctrl+C to stop.")
     print("=" * 60)
     print()
