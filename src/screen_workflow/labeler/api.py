@@ -19,8 +19,12 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
+
+if TYPE_CHECKING:
+    from screen_workflow.cost_monitor import CostMonitor
 
 from screen_workflow.labeler.batch import build_batches
 from screen_workflow.schemas import (
@@ -542,12 +546,18 @@ def process_session(
     model: str = DEFAULT_MODEL,
     api_key: str | None = None,
     dry_run: bool = False,
+    cost_monitor: "CostMonitor | None" = None,
 ) -> tuple[dict[str, Workflow], list[Observation], int]:
     """Run Claude on one session, splitting into multiple chunks if needed.
 
     Each chunk = one Anthropic call. The workflow graph in the store gets
     updated after each chunk, so the next chunk's directory reflects the
     state Claude built up so far — building the mental model incrementally.
+
+    If ``cost_monitor`` is given, each chunk's token usage is recorded to it.
+    The monitor is not consulted *here* to pause mid-session — the caller
+    gates whole sessions via ``CostMonitor.should_pause()`` so a session is
+    never left half-labeled; one session's overshoot is negligible.
     """
     events = list(store.iter_events(session.session_id))
     if not events:
@@ -597,12 +607,28 @@ def process_session(
             messages=_build_messages(directory, batch),
         )
         text = "\n".join(b.text for b in resp.content if getattr(b, "type", None) == "text").strip()
+        in_toks = getattr(resp.usage, "input_tokens", 0) or 0
+        out_toks = getattr(resp.usage, "output_tokens", 0) or 0
         log.info(
             "  chunk %d: claude returned %d output tokens (stop_reason=%s)",
             i,
-            getattr(resp.usage, "output_tokens", -1),
+            out_toks,
             resp.stop_reason,
         )
+        if cost_monitor is not None:
+            snap = cost_monitor.record(
+                model=model,
+                input_tokens=in_toks,
+                output_tokens=out_toks,
+                session_id=session.session_id,
+            )
+            log.info(
+                "  chunk %d: cost so far $%.2f this hour / $%.2f this run (%s)",
+                i,
+                snap.usd_last_hour,
+                snap.usd_total_run,
+                snap.state.value,
+            )
 
         response = _extract_json(text)
         touched, observations, noise_count = merge_response(
@@ -666,16 +692,23 @@ def process_all_unprocessed_sessions(
     *,
     model: str = DEFAULT_MODEL,
     dry_run: bool = False,
+    cost_monitor: "CostMonitor | None" = None,
 ) -> int:
-    """Process every session not yet recorded in ANY workflow."""
-    seen_session_ids: set[str] = set()
-    for wf in store.iter_workflows():
-        seen_session_ids.update(wf.sessions_processed)
+    """Process every session not yet sent through the labeler.
+
+    Dedup uses ``labeled_sessions`` (see ``Store.mark_session_labeled``), so
+    noise-only sessions — which touch no workflow — are not re-labeled.
+    """
+    labeled = store.labeled_session_ids()
     n = 0
     for session in store.iter_sessions():
-        if session.session_id in seen_session_ids:
+        if session.session_id in labeled:
             continue
-        process_session(store, session, model=model, dry_run=dry_run)
+        process_session(
+            store, session, model=model, dry_run=dry_run, cost_monitor=cost_monitor
+        )
+        if not dry_run:
+            store.mark_session_labeled(session.session_id)
         n += 1
     return n
 

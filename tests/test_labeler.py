@@ -1,11 +1,19 @@
-"""Per-action routing labeler: batch builder + merge_response (no API calls)."""
+"""Per-action routing labeler: batch builder + merge_response + cost wiring."""
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from screen_workflow.labeler.api import _extract_json, _new_workflow, merge_response
+import pytest
+
+from screen_workflow.cost_monitor import CostMonitor
+from screen_workflow.labeler.api import (
+    _extract_json,
+    _new_workflow,
+    merge_response,
+    process_session,
+)
 from screen_workflow.labeler.batch import APPROX_TOKENS_PER_IMAGE, build_batch
 from screen_workflow.schemas import (
     Event,
@@ -228,3 +236,96 @@ class TestExtractJson:
     def test_extracts_when_prose_around(self) -> None:
         text = 'Here you go: {"a": [1,2]}\nThanks!'
         assert _extract_json(text) == {"a": [1, 2]}
+
+
+# ---------------------------------------------------------------------------
+# process_session cost wiring — Anthropic client mocked
+# ---------------------------------------------------------------------------
+
+
+class _FakeUsage:
+    def __init__(self, input_tokens: int, output_tokens: int) -> None:
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+
+
+class _FakeBlock:
+    def __init__(self, text: str) -> None:
+        self.type = "text"
+        self.text = text
+
+
+class _FakeResponse:
+    def __init__(self, text: str, input_tokens: int, output_tokens: int) -> None:
+        self.content = [_FakeBlock(text)]
+        self.usage = _FakeUsage(input_tokens, output_tokens)
+        self.stop_reason = "end_turn"
+
+
+class _FakeMessages:
+    def __init__(self, response: _FakeResponse) -> None:
+        self._response = response
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):  # noqa: ANN003
+        self.calls.append(kwargs)
+        return self._response
+
+
+class _FakeAnthropic:
+    """Stand-in for anthropic.Anthropic — returns an empty-but-valid label."""
+
+    EMPTY_LABEL = '{"actions": [], "edges": [], "workflow_summaries": []}'
+
+    def __init__(self, api_key: str | None = None) -> None:
+        self.api_key = api_key
+        self.messages = _FakeMessages(_FakeResponse(self.EMPTY_LABEL, 10_000, 2_000))
+
+
+class TestProcessSessionCost:
+    def test_records_token_cost_to_monitor(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr("anthropic.Anthropic", _FakeAnthropic)
+        store = Store(tmp_path / "data")
+        for i in range(3):
+            ev = _event(i)
+            store.insert_event(ev)
+            _png(store.screens_dir / ev.screenshot_path)
+        session = _session()
+        store.insert_session(session)
+
+        monitor = CostMonitor(
+            store,
+            soft_alert_usd_per_hour=10,
+            hard_stop_usd_per_hour=30,
+            total_spend_cap_usd=100,
+        )
+        process_session(
+            store,
+            session,
+            model="claude-sonnet-4-6",
+            api_key="test-key",
+            cost_monitor=monitor,
+        )
+
+        snap = monitor.snapshot()
+        assert snap.n_calls >= 1
+        # Sonnet: 10K in * $3/M + 2K out * $15/M = $0.03 + $0.03 = $0.06 per call
+        assert snap.usd_total_run == pytest.approx(0.06 * snap.n_calls, abs=1e-4)
+
+    def test_no_monitor_still_works(self, tmp_path: Path, monkeypatch) -> None:
+        """cost_monitor is optional — process_session runs fine without one."""
+        monkeypatch.setattr("anthropic.Anthropic", _FakeAnthropic)
+        store = Store(tmp_path / "data")
+        for i in range(3):
+            ev = _event(i)
+            store.insert_event(ev)
+            _png(store.screens_dir / ev.screenshot_path)
+        session = _session()
+        store.insert_session(session)
+
+        touched, obs, noise = process_session(
+            store, session, model="claude-sonnet-4-6", api_key="test-key"
+        )
+        assert touched == {}  # empty label -> no workflows
+        assert obs == []
+        assert noise == 0

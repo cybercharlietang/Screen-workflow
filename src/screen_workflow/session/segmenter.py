@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from screen_workflow.schemas import Event, Session, SessionCloseReason
@@ -107,6 +107,107 @@ def segment_and_persist(store: Store, cfg: SegmenterConfig | None = None) -> lis
         len(unassigned),
         len(sessions),
     )
+    return sessions
+
+
+# ---------------------------------------------------------------------------
+# Streaming segmenter — for live mode
+# ---------------------------------------------------------------------------
+
+
+def segment_incremental(
+    events: list[Event],
+    cfg: SegmenterConfig,
+    now: datetime,
+    *,
+    force: bool = False,
+) -> list[Session]:
+    """Segment unassigned events, returning only sessions that have *definitely*
+    closed.
+
+    Unlike :func:`segment`, the trailing bucket is left OPEN — its events are
+    excluded from the result — unless one of:
+
+    - a hard close reason fires (duration cap, max events), or
+    - a confirmed idle gap to a later event in the stream, or
+    - wall-clock idle: ``now - last_event > idle_gap_seconds``, or
+    - ``force=True`` (shutdown flush).
+
+    Leaving the tail open is what makes the streaming segmenter idempotent: a
+    bucket that could still grow stays unassigned and is re-evaluated on the
+    next tick. ``now`` must be timezone-aware to match captured event
+    timestamps.
+    """
+    if not events:
+        return []
+
+    sessions: list[Session] = []
+    bucket_ids: list[str] = []
+    bucket_start = events[0].ts
+    bucket_last = events[0].ts
+
+    for i, e in enumerate(events):
+        nxt = events[i + 1].ts if i + 1 < len(events) else None
+        bucket_ids.append(e.event_id)
+        bucket_last = e.ts
+
+        reason = _close_reason(cfg, bucket_start, bucket_last, nxt, len(bucket_ids))
+
+        if reason is None and nxt is None:
+            # Trailing bucket: no later event to confirm an idle gap. Close it
+            # only if it has gone idle in wall-clock time, or we are flushing.
+            idle = (now - bucket_last).total_seconds() > cfg.idle_gap_seconds
+            if force or idle:
+                reason = SessionCloseReason.IDLE_GAP
+            else:
+                break  # leave the trailing bucket open for the next tick
+
+        if reason is not None:
+            sessions.append(
+                Session(
+                    session_id=f"sess_{uuid.uuid4().hex[:10]}",
+                    start_ts=bucket_start,
+                    end_ts=bucket_last,
+                    close_reason=reason,
+                    event_ids=list(bucket_ids),
+                )
+            )
+            bucket_ids = []
+            if nxt is not None:
+                bucket_start = nxt
+                bucket_last = nxt
+
+    return sessions
+
+
+def segment_and_persist_incremental(
+    store: Store,
+    cfg: SegmenterConfig | None = None,
+    *,
+    force: bool = False,
+) -> list[Session]:
+    """One streaming-segmenter tick: segment unassigned events and persist only
+    the sessions that have definitely closed.
+
+    Idempotent — safe to call on a schedule against a growing event stream.
+    Pass ``force=True`` on shutdown to also close the open trailing bucket.
+    """
+    cfg = cfg or SegmenterConfig()
+    unassigned = [e for e in store.iter_events() if e.session_id is None]
+    if not unassigned:
+        return []
+    sessions = segment_incremental(
+        unassigned, cfg, datetime.now(timezone.utc), force=force
+    )
+    for s in sessions:
+        store.insert_session(s)
+    if sessions:
+        log.info(
+            "segmenter: %d unassigned event(s) -> closed %d session(s)%s",
+            len(unassigned),
+            len(sessions),
+            " (forced flush)" if force else "",
+        )
     return sessions
 
 

@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
@@ -88,6 +88,11 @@ CREATE TABLE IF NOT EXISTS api_calls (
     usd_cost       REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_api_calls_ts ON api_calls(ts);
+
+CREATE TABLE IF NOT EXISTS labeled_sessions (
+    session_id  TEXT PRIMARY KEY,
+    labeled_at  TEXT NOT NULL
+);
 """
 
 
@@ -312,6 +317,28 @@ class Store:
                 int(row[5]),
                 float(row[6]),
             )
+
+    # -- labeled sessions (streaming-labeler dedup) ------------------------
+
+    def mark_session_labeled(
+        self, session_id: str, *, labeled_at: datetime | None = None
+    ) -> None:
+        """Record that a session has been through the labeler.
+
+        Dedup key for the streaming labeler. Unlike workflow.sessions_processed
+        this covers noise-only sessions too — those touch no workflow, so
+        without this they'd be re-labeled (and re-billed) every tick.
+        """
+        self._conn.execute(
+            "INSERT OR REPLACE INTO labeled_sessions VALUES (?,?)",
+            (session_id, (labeled_at or datetime.now(timezone.utc)).isoformat()),
+        )
+
+    def labeled_session_ids(self) -> set[str]:
+        return {
+            row[0]
+            for row in self._conn.execute("SELECT session_id FROM labeled_sessions")
+        }
 
     # -- lifecycle ---------------------------------------------------------
 
