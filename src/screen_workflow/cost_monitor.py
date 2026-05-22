@@ -24,12 +24,14 @@ from screen_workflow.storage.db import Store
 log = logging.getLogger(__name__)
 
 
-# Per-million-token prices in USD. Keys are substring matches against the
-# requested model name (lowercased) — first match wins, so list more
-# specific keys first.
+# Per-million-token prices in USD (input, output). Keys are substring matches
+# against the requested model name (lowercased) — first match wins, so list
+# more specific keys first. Source: claude-api skill model table, dated
+# 2026-04-29. NOTE: LESSONS.md L16 cites Opus at $15/$75 — that is stale
+# (old Claude 3 Opus pricing); Opus 4.x is $5/$25.
 _PRICING: list[tuple[str, float, float]] = [
-    ("opus-4-7", 15.0, 75.0),
-    ("opus-4", 15.0, 75.0),
+    ("opus-4-7", 5.0, 25.0),
+    ("opus-4", 5.0, 25.0),
     ("sonnet-4-6", 3.0, 15.0),
     ("sonnet-4-5", 3.0, 15.0),
     ("sonnet-4", 3.0, 15.0),

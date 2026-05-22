@@ -60,15 +60,36 @@ def _png(path: Path) -> None:
 
 
 class TestBatch:
-    def test_under_budget_keeps_all(self, tmp_path: Path) -> None:
+    def test_small_session_keeps_all(self, tmp_path: Path) -> None:
         screens = tmp_path / "screens"
         events = []
         for i in range(5):
             events.append(_event(i))
             _png(screens / f"x_{i}.png")
-        batch = build_batch(events, screens, budget_tokens=400_000)
+        batch = build_batch(events, screens)
         assert "frame_id\tts\tapp" in batch.event_log_text
         assert len(batch.selected_frame_ids) == 5
+
+    def test_frame_ceiling_caps_images(self, tmp_path: Path) -> None:
+        from screen_workflow.labeler.batch import MAX_FRAMES_PER_SESSION, build_batches
+
+        screens = tmp_path / "screens"
+        n = MAX_FRAMES_PER_SESSION + 25
+        events = []
+        for i in range(n):
+            events.append(_event(i))
+            _png(screens / f"x_{i}.png")
+        batches = build_batches(events, screens)
+
+        all_ids = [fid for b in batches for fid in b.selected_frame_ids]
+        assert len(all_ids) == MAX_FRAMES_PER_SESSION  # images are capped
+        assert "f_000" in all_ids  # first frame always survives
+        assert f"f_{n - 1:03d}" in all_ids  # last frame always survives
+        dropped = [d for b in batches for d in b.dropped_frame_ids]
+        assert len(dropped) == n - MAX_FRAMES_PER_SESSION
+        # The event-log table still covers every event — text is never capped.
+        for e in events:
+            assert e.event_id in batches[0].event_log_text
 
     def test_build_batches_splits_into_chunks(self, tmp_path: Path) -> None:
         from screen_workflow.labeler.batch import (

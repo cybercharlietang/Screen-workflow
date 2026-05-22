@@ -1,13 +1,12 @@
-"""Compose a multimodal Claude request from one session.
+"""Compose the per-session payload (event log + screenshots) for the labeler.
 
-Includes:
-- system prompt with CAGE taxonomy and output schema
-- the event log as a structured text table (always — cheap)
+A Batch carries:
+- the event log as a structured text table (always — cheap, covers every event)
 - chronologically-ordered screenshots tagged with their frame_id
 
-Token budget is enforced by downsampling screenshots if needed. Per-image
-token cost is approximated as ~1500 tokens (Claude's tiling cost for a
-typical 1080p screenshot at default detail).
+The system prompt is supplied by the labeler (``labeler/api.py``), not here.
+Per-image token cost is approximated as ~1500 tokens (Claude's tiling cost for
+a typical 1080p screenshot at default detail).
 """
 
 from __future__ import annotations
@@ -25,7 +24,12 @@ from screen_workflow.schemas import Event
 log = logging.getLogger(__name__)
 
 APPROX_TOKENS_PER_IMAGE = 1500
-DEFAULT_BUDGET = 400_000  # leave headroom below 500K for response generation
+
+# Hard ceiling on screenshots sent to Claude per session. The event-log table
+# always covers every event (text is cheap); only images are capped. A session
+# with working dedupe lands well under this — the ceiling is a safety bound so
+# a noisy session can't fan out into dozens of API calls. ~80 frames ≈ 14 chunks.
+MAX_FRAMES_PER_SESSION = 80
 
 # Anthropic per-request size cap is 32 MB. We send full-resolution PNGs
 # (no compression — pixel detail matters for OCR + UI element reading) and
@@ -47,78 +51,12 @@ MAX_PER_IMAGE_BYTES = 4 * 1024 * 1024
 # And for multi-image requests, each image's largest dimension must be
 # <= 2000 px. We resize anything that exceeds this regardless of file size.
 MAX_IMAGE_DIMENSION_PX = 2000
-SYSTEM_PROMPT = """\
-You are a procurement-workflow analyst at Fragment. You will be shown a
-chronological session of one employee's screen activity: a structured event
-log table and the corresponding screenshots.
-
-Your job: identify the discrete *cognitive actions* the user performed and
-label each one under the **CAGE** taxonomy:
-
-  - C — Capture: ingesting data into the user's working memory.
-        Reading an email, opening a vendor record, downloading a PDF.
-  - A — Analyze: interpreting, comparing, reasoning over captured data.
-        Reconciling invoice lines, checking budget, deciding vendors.
-  - G — Generate: producing new content.
-        Drafting an approval email, writing free-text comments.
-  - E — Extract: pulling structured fields from unstructured sources.
-        OCR'ing an invoice, copying numbers into a form.
-
-CRUCIAL guidelines:
-
-1. **Merge into cognitive units.** Five clicks while filling one form is
-   ONE action ("filled out vendor form"), not five. Match the natural
-   one-line description a human reviewer would give.
-2. **Ignore noise.** Slack pings, lunch breaks, unrelated browsing —
-   omit. Only return procurement-relevant actions.
-3. **Be specific in `data_object`.** "PO #12345" beats "purchase order."
-   If you can't tell, write "(unknown)".
-4. **`estimated_tokens` is the input+output cost of ONE LLM call** an
-   agent would make to perform this action — context it reads + its
-   reasoning + its output. Typical ranges:
-     - Capture / Extract (reading short content): 500–3,000
-     - Analyze (comparison/reasoning): 2,000–8,000
-     - Generate (drafting an email, report): 1,500–10,000
-   Use the upper end when the action involves long documents.
-5. **`expected_agent_steps` is the count of distinct LLM calls** the
-   agent would need:
-     - 1 for a single read+act (e.g., "open this email")
-     - 2–3 for compare/decide (e.g., "reconcile invoice vs PO")
-     - 4+ only for genuinely multi-step actions
-6. **`confidence` 0.0–1.0** — be honest. If the screenshots don't
-   support the label well, drop below 0.6.
-7. **Cite evidence.** `evidence_frame_ids` must reference real
-   `frame_id` values from the input.
-
-Return ONLY a JSON object of the form:
-
-{
-  "actions": [
-    {
-      "action_id": "act_1",
-      "cage_label": "C|A|G|E",
-      "system": "Outlook|SAP|Excel|Chrome|...",
-      "data_object": "...",
-      "estimated_tokens": 2500,
-      "expected_agent_steps": 1,
-      "start_frame_id": "<id>",
-      "end_frame_id": "<id>",
-      "evidence_frame_ids": ["<id>", ...],
-      "confidence": 0.82,
-      "rationale": "one short sentence"
-    }
-  ]
-}
-
-No prose outside the JSON.
-"""
 
 
 @dataclass
 class Batch:
-    """Materialized request payload."""
+    """Materialized request payload (one Anthropic call's worth of images)."""
 
-    system: str
     event_log_text: str
     images: list[dict] = field(default_factory=list)  # anthropic content blocks
     selected_frame_ids: list[str] = field(default_factory=list)
@@ -146,14 +84,14 @@ def _event_log_table(events: list[Event]) -> str:
 
 def _select_images(
     events: list[Event],
-    screens_root: Path,
-    budget_tokens: int,
-    overhead_tokens: int,
+    max_images: int,
 ) -> tuple[list[Event], list[Event]]:
-    """Return (selected, dropped) such that selected.images fit budget."""
-    available = budget_tokens - overhead_tokens
-    max_images = max(0, available // APPROX_TOKENS_PER_IMAGE)
+    """Return (selected, dropped) capping the image set at ``max_images``.
 
+    Keeps state-transition frames (saves, submits, focus/URL changes, pastes)
+    plus the first and last frame, then fills the remainder by evenly-spaced
+    sampling so the session stays visually represented end to end.
+    """
     if len(events) <= max_images:
         return events, []
 
@@ -283,24 +221,19 @@ def _image_block(event: Event, screens_root: Path) -> dict | None:
     }
 
 
-def build_batch(
-    events: list[Event],
-    screens_root: Path,
-    budget_tokens: int = DEFAULT_BUDGET,
-) -> Batch:
+def build_batch(events: list[Event], screens_root: Path) -> Batch:
     """Single-batch convenience wrapper — collapses all chunks into one batch.
 
     Useful for tests and small sessions. For real sessions prefer
     ``build_batches`` which splits into chunks under Anthropic's 32 MB cap.
     """
-    chunks = build_batches(events, screens_root, budget_tokens)
+    chunks = build_batches(events, screens_root)
     if not chunks:
-        return Batch(system=SYSTEM_PROMPT, event_log_text=_event_log_table(events))
+        return Batch(event_log_text=_event_log_table(events))
     if len(chunks) == 1:
         return chunks[0]
     # Merge — used only by tests; production calls build_batches and iterates.
     merged = Batch(
-        system=SYSTEM_PROMPT,
         event_log_text=chunks[0].event_log_text,
         images=[],
         selected_frame_ids=[],
@@ -315,27 +248,39 @@ def build_batch(
     return merged
 
 
-def build_batches(
-    events: list[Event],
-    screens_root: Path,
-    budget_tokens: int = DEFAULT_BUDGET,
-) -> list[Batch]:
+def build_batches(events: list[Event], screens_root: Path) -> list[Batch]:
     """Split a session into one or more Batches that each fit Anthropic's cap.
 
     Each returned Batch contains:
       - the FULL event log of the whole session (cheap text, always include)
       - a contiguous slice of images
-    Chunking is by accumulated base64 size and by image count cap.
+
+    Images are capped at ``MAX_FRAMES_PER_SESSION`` per session (state-transition
+    frames kept, the rest evenly sampled); the result is then chunked by
+    accumulated base64 size and image-count cap.
     """
     if not events:
         return []
 
     event_log = _event_log_table(events)
-    overhead = len(SYSTEM_PROMPT) // 3 + len(event_log) // 3 + 2_000
+    # Estimate of the non-image input: system prompt (~1.1K tokens, lives in
+    # api.py) + the event-log table + the workflow directory + instructions.
+    overhead = len(event_log) // 3 + 3_000
+
+    # Cap images per session before the (expensive) PIL/base64 encode, so we
+    # never encode frames we're going to drop.
+    image_events, budget_dropped = _select_images(events, MAX_FRAMES_PER_SESSION)
+    if budget_dropped:
+        log.info(
+            "session over %d-frame cap: sending %d image(s), dropping %d",
+            MAX_FRAMES_PER_SESSION,
+            len(image_events),
+            len(budget_dropped),
+        )
 
     # Build raw image blocks once (PIL/base64 happens here), then chunk
     image_records: list[tuple[Event, dict, dict, int]] = []
-    for e in events:
+    for e in image_events:
         block = _image_block(e, screens_root)
         if block is None:
             continue
@@ -347,10 +292,11 @@ def build_batches(
         size_bytes = len(block["source"]["data"])
         image_records.append((e, marker, block, size_bytes))
 
+    budget_dropped_ids = [ev.event_id for ev in budget_dropped]
+
     if not image_records:
         return [
             Batch(
-                system=SYSTEM_PROMPT,
                 event_log_text=event_log,
                 images=[],
                 selected_frame_ids=[],
@@ -370,11 +316,11 @@ def build_batches(
             return
         batches.append(
             Batch(
-                system=SYSTEM_PROMPT,
                 event_log_text=event_log,
                 images=cur_images,
                 selected_frame_ids=cur_ids,
-                dropped_frame_ids=[],
+                # Cap-dropped frames are recorded on the first batch only.
+                dropped_frame_ids=budget_dropped_ids if not batches else [],
                 approx_input_tokens=overhead + len(cur_ids) * APPROX_TOKENS_PER_IMAGE,
             )
         )

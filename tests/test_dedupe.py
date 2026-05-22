@@ -52,6 +52,30 @@ class TestAlwaysKeep:
         assert d.should_keep(_solid((50, 50, 50)), TriggerType.SUBMIT, "w1") is True
 
 
+class TestMutationDedup:
+    def test_first_save_kept(self) -> None:
+        d = Deduper()
+        assert d.should_keep(_solid((30, 30, 30)), TriggerType.SAVE) is True
+
+    def test_repeated_save_on_unchanged_screen_dropped(self) -> None:
+        d = Deduper()
+        d.should_keep(_solid((30, 30, 30)), TriggerType.SAVE)
+        # Identical screen — a second save carries no new signal.
+        assert d.should_keep(_solid((30, 30, 30)), TriggerType.SAVE) is False
+
+    def test_save_after_screen_change_kept(self) -> None:
+        d = Deduper()
+        d.should_keep(_noisy(1), TriggerType.SAVE)
+        # Screen changed substantially — the second save is real signal.
+        assert d.should_keep(_noisy(42), TriggerType.SAVE) is True
+
+    def test_mutation_dedupes_against_any_prior_kept_frame(self) -> None:
+        d = Deduper()
+        d.should_keep(_solid((80, 80, 80)), TriggerType.HEARTBEAT)
+        # Paste onto a screen identical to the last kept frame — dropped.
+        assert d.should_keep(_solid((80, 80, 80)), TriggerType.PASTE) is False
+
+
 class TestClick:
     def test_first_click_kept(self) -> None:
         d = Deduper()

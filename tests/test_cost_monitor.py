@@ -31,7 +31,7 @@ def now() -> datetime:
 
 
 def test_pricing_opus_4_7():
-    assert price_for("claude-opus-4-7") == (15.0, 75.0)
+    assert price_for("claude-opus-4-7") == (5.0, 25.0)
 
 
 def test_pricing_sonnet_4_6():
@@ -48,8 +48,8 @@ def test_pricing_unknown_model_raises():
 
 
 def test_usd_cost_opus():
-    # 1M input on Opus = $15, 1M output = $75
-    assert usd_cost("claude-opus-4-7", 1_000_000, 1_000_000) == pytest.approx(90.0)
+    # 1M input on Opus 4.7 = $5, 1M output = $25
+    assert usd_cost("claude-opus-4-7", 1_000_000, 1_000_000) == pytest.approx(30.0)
 
 
 def test_usd_cost_sonnet_realistic_session():
@@ -120,29 +120,25 @@ def test_record_persists_and_updates_snapshot(store, now):
 
 def test_soft_alert_fires_at_threshold(store, now):
     cm = _mk(store, now)
-    # Hit ~$10 — needs many sonnet calls or a big opus one.
-    # Opus: $15/M input, $75/M output. 600K input + 1K output = $9 + $0.075 = ~$9.08 (still OK)
-    # Push to $10+ with another small call.
-    cm.record(model="claude-opus-4-7", input_tokens=600_000, output_tokens=10_000, ts=now)
+    # Opus 4.7 input is $5/M, so 2.4M input tokens = $12 — in [$10 soft, $30 hard).
     snap = cm.record(
         model="claude-opus-4-7",
-        input_tokens=100_000,
-        output_tokens=10_000,
+        input_tokens=2_400_000,
+        output_tokens=0,
         ts=now,
     )
-    assert snap.usd_last_hour >= 10
-    assert snap.usd_last_hour < 30
+    assert snap.usd_last_hour == pytest.approx(12.0)
     assert snap.state == CostState.SOFT_ALERT
     assert "soft alert" in (snap.reason or "")
 
 
 def test_hard_stop_fires_when_hourly_exceeds(store, now):
     cm = _mk(store, now)
-    # $30 in an hour — easy on Opus.
+    # 7M input tokens on Opus 4.7 = $35 — over the $30/hr hard stop.
     snap = cm.record(
         model="claude-opus-4-7",
-        input_tokens=2_000_000,
-        output_tokens=10_000,
+        input_tokens=7_000_000,
+        output_tokens=0,
         ts=now,
     )
     assert snap.usd_last_hour >= 30
@@ -153,13 +149,13 @@ def test_hard_stop_fires_when_hourly_exceeds(store, now):
 def test_hard_stop_fires_when_total_cap_exceeds_even_if_hourly_low(store, now):
     """Spread spend over many hours, never breach hourly, breach total cap."""
     cm = _mk(store, now)
-    # Five $25 calls spread out 90 minutes apart — each is under hard hourly
-    # but total = $125 > $100 cap.
+    # Five $25 calls (5M input tokens each on Opus 4.7) spread 90 min apart —
+    # each call's hour stays under the $30 hard stop, but total = $125 > $100.
     for i in range(5):
         cm.record(
             model="claude-opus-4-7",
-            input_tokens=1_500_000,
-            output_tokens=10_000,
+            input_tokens=5_000_000,
+            output_tokens=0,
             ts=now + timedelta(minutes=90 * i),
         )
     snap = cm.snapshot(now=now + timedelta(minutes=90 * 5))
@@ -170,30 +166,30 @@ def test_hard_stop_fires_when_total_cap_exceeds_even_if_hourly_low(store, now):
 
 def test_rolling_hour_window_excludes_old_calls(store, now):
     cm = _mk(store, now - timedelta(hours=3))
-    # Record an expensive call 2 hours ago — should be in total but NOT hourly.
+    # Record an expensive call 2 hours ago ($35) — in total but NOT in the hour.
     cm.record(
         model="claude-opus-4-7",
-        input_tokens=2_000_000,
-        output_tokens=10_000,
+        input_tokens=7_000_000,
+        output_tokens=0,
         ts=now - timedelta(hours=2),
     )
     snap = cm.snapshot(now=now)
     assert snap.usd_total_run >= 30
     assert snap.usd_last_hour == 0
-    # Hourly is OK, but the total cap may have triggered. With $30 < $100 cap, still OK.
+    # Hourly is OK and $35 < $100 cap, so overall OK.
     assert snap.state == CostState.OK
 
 
 def test_should_pause_only_on_hard_stop(store, now):
     cm = _mk(store, now)
     assert not cm.should_pause(now=now)
-    # Soft alert: should NOT pause.
-    cm.record(model="claude-opus-4-7", input_tokens=700_000, output_tokens=10_000, ts=now)
+    # Soft alert ($12 < $30 hard): should NOT pause.
+    cm.record(model="claude-opus-4-7", input_tokens=2_400_000, output_tokens=0, ts=now)
     snap = cm.snapshot(now=now)
     assert snap.state == CostState.SOFT_ALERT
     assert not cm.should_pause(now=now)
-    # Hard stop: should pause.
-    cm.record(model="claude-opus-4-7", input_tokens=1_500_000, output_tokens=10_000, ts=now)
+    # Another $20 pushes the hour to $32 — hard stop: should pause.
+    cm.record(model="claude-opus-4-7", input_tokens=4_000_000, output_tokens=0, ts=now)
     assert cm.should_pause(now=now)
 
 
@@ -202,15 +198,15 @@ def test_recovery_after_hour_passes(store, now):
     cm = _mk(store, now)
     cm.record(
         model="claude-opus-4-7",
-        input_tokens=2_000_000,
-        output_tokens=10_000,
+        input_tokens=7_000_000,
+        output_tokens=0,
         ts=now,
     )
     assert cm.snapshot(now=now).state == CostState.HARD_STOP
     # 65 min later: the old call should have aged out.
     later_snap = cm.snapshot(now=now + timedelta(minutes=65))
     assert later_snap.usd_last_hour == 0
-    # Total cap unchanged though — at ~$30.75, still under $100.
+    # Total cap unchanged — at $35, still under $100.
     assert later_snap.state == CostState.OK
 
 

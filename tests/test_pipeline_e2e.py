@@ -62,7 +62,7 @@ def test_segment_batch_merge_end_to_end(tmp_path: Path) -> None:
     assert len(session.event_ids) == 6
 
     # 3) Build batch
-    batch = build_batch(events, store.screens_dir, budget_tokens=400_000)
+    batch = build_batch(events, store.screens_dir)
     assert len(batch.selected_frame_ids) == 6
     assert "frame_id\tts\tapp" in batch.event_log_text
 
