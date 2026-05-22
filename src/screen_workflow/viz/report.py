@@ -12,11 +12,12 @@ import html
 import io
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from PIL import Image
 
+from screen_workflow.cost_monitor import CostMonitor
 from screen_workflow.schemas import Event, Observation, Session, Workflow
 from screen_workflow.storage.db import Store
 
@@ -27,6 +28,8 @@ log = logging.getLogger(__name__)
 MAX_EVENTS_RENDERED = 100
 THUMBNAIL_MAX_PX = 480
 THUMBNAIL_JPEG_QUALITY = 60
+# Cap the per-call cost history sent to the page so data.json stays light.
+MAX_API_CALLS_RENDERED = 200
 
 
 def _ts(dt: datetime) -> str:
@@ -154,6 +157,77 @@ def _read_status(store_root: Path) -> dict:
         return {"present": False}
 
 
+def _read_run_metadata(store_root: Path) -> dict:
+    """Read run_metadata.json (written by live.py at startup) if present."""
+    p = store_root / "run_metadata.json"
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _cost_monitor_payload(store: Store) -> dict:
+    """Live API-spend snapshot + recent per-call history.
+
+    Thresholds + run start come from run_metadata.json so the viz shows the
+    same numbers the labeler's cost guard enforces. Falls back to defaults
+    when no metadata is present (e.g. viewing an older capture).
+    """
+    meta = _read_run_metadata(store.root)
+    args = meta.get("args", {})
+    soft = float(args.get("soft_alert_usd_per_hour", 10.0) or 10.0)
+    hard = float(args.get("hard_stop_usd_per_hour", 30.0) or 30.0)
+    cap = float(args.get("total_spend_cap_usd", 100.0) or 100.0)
+    started_at = None
+    raw_start = meta.get("started_at")
+    if raw_start:
+        try:
+            started_at = datetime.fromisoformat(raw_start)
+        except ValueError:
+            started_at = None
+
+    calls = list(store.iter_api_calls())  # chronological
+    # No run_metadata.json (viewing an older capture): "run total" should mean
+    # all calls, so anchor the run to the earliest recorded call.
+    if started_at is None:
+        started_at = calls[0][1] if calls else datetime.now(timezone.utc)
+
+    try:
+        monitor = CostMonitor(
+            store,
+            soft_alert_usd_per_hour=soft,
+            hard_stop_usd_per_hour=max(hard, soft),
+            total_spend_cap_usd=cap if cap > 0 else 100.0,
+            run_started_at=started_at,
+        )
+        snapshot = monitor.snapshot().to_dict()
+    except Exception:  # noqa: BLE001 — never let cost rendering break the viz
+        log.exception("cost snapshot failed")
+        snapshot = None
+
+    calls.reverse()  # newest first
+    call_dicts = [
+        {
+            "ts": _ts(c[1]),
+            "model": c[2],
+            "session_id": c[3],
+            "input_tokens": c[4],
+            "output_tokens": c[5],
+            "usd_cost": round(c[6], 4),
+        }
+        for c in calls[:MAX_API_CALLS_RENDERED]
+    ]
+    return {
+        "snapshot": snapshot,
+        "calls": call_dicts,
+        "calls_total": len(calls),
+        "labeler_model": args.get("labeler_model"),
+        "labeler_disabled": bool(args.get("no_labeler")),
+    }
+
+
 def _read_audit_logs(store_root: Path) -> list[dict]:
     """All per-session labeler audit logs, newest first."""
     audit_dir = store_root / "audit"
@@ -225,6 +299,7 @@ def render(
         "workflows": workflows,
         "observations": observations,
         "cost_summary": cost_summary,
+        "cost_monitor": _cost_monitor_payload(store),
         "daemon_status": _read_status(store.root),
         "audit_logs": _read_audit_logs(store.root),
     }
@@ -296,6 +371,19 @@ __AUTO_REFRESH__
   .pill-paste, .pill-save, .pill-submit, .pill-file_open, .pill-file_save, .pill-url_change { background: #999; }
   .empty { color: #888; font-style: italic; padding: 12px 0; }
   .num { font-variant-numeric: tabular-nums; text-align: right; }
+  .flow { display: flex; flex-direction: column; gap: 6px; margin: 6px 0 12px 0; }
+  .flow-edge { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .flow-node { display: inline-flex; align-items: center; gap: 6px; background: #f4f4f4;
+    border: 1px solid #ddd; border-radius: 6px; padding: 4px 8px; font-size: 12px; }
+  .flow-arrow { color: #888; font-weight: 600; }
+  .flow-count { color: #999; font-size: 11px; }
+  .cost-tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 8px 0 16px 0; }
+  .cost-tile { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 12px 14px; }
+  .cost-tile .k { color: #666; font-size: 12px; }
+  .cost-tile .v { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .cost-tile .sub { color: #888; font-size: 11px; margin-top: 2px; }
+  .cost-tile.warn { border-color: #d97706; }
+  .cost-tile.bad { border-color: #b91c1c; }
 </style>
 </head>
 <body>
@@ -309,6 +397,12 @@ __AUTO_REFRESH__
     <div class="row"><span class="label">Listeners</span><span class="value" id="status-listeners">—</span></div>
     <div class="row"><span class="label">Events captured</span><span class="value" id="status-events">—</span></div>
     <div class="row"><span class="label">Last event</span><span class="value" id="status-last">—</span></div>
+  </div>
+  <div class="status-card" id="cost-card">
+    <div class="row"><span class="label">API spend · run</span><span class="value" id="cost-run">—</span></div>
+    <div class="row"><span class="label">API spend · last hour</span><span class="value" id="cost-hour">—</span></div>
+    <div class="row"><span class="label">Cost state</span><span class="value" id="cost-state">—</span></div>
+    <div class="row"><span class="label">Last label call</span><span class="value" id="cost-last">—</span></div>
   </div>
 </header>
 <nav>
@@ -350,7 +444,7 @@ __AUTO_REFRESH__
   </section>
 </main>
 <script>
-const POLL_INTERVAL_MS = 3000;
+const POLL_INTERVAL_MS = 30000;
 let currentData = null;
 
 // Format any ISO timestamp as Pacific time (America/Los_Angeles).
@@ -467,6 +561,34 @@ function render(data) {
       errDiv.textContent = 'Daemon error: ' + s.last_error;
       document.body.insertBefore(errDiv, document.body.firstChild.nextSibling);
     }
+  })();
+
+  // Cost monitor — header card
+  (function () {
+    const cm = data.cost_monitor || {};
+    const snap = cm.snapshot;
+    const run = document.getElementById('cost-run');
+    const hour = document.getElementById('cost-hour');
+    const state = document.getElementById('cost-state');
+    const last = document.getElementById('cost-last');
+    if (!snap) {
+      run.textContent = '—'; hour.textContent = '—';
+      state.innerHTML = '<span class="badge" style="background:#555">no data</span>';
+      last.textContent = '—';
+      return;
+    }
+    run.textContent = '$' + snap.usd_total_run.toFixed(2)
+      + ' / $' + snap.total_spend_cap_usd.toFixed(0) + ' cap';
+    hour.textContent = '$' + snap.usd_last_hour.toFixed(2)
+      + ' / $' + snap.hard_stop_usd_per_hour.toFixed(0) + ' stop';
+    const stateBadge = {
+      ok: '<span class="badge badge-ok">ok</span>',
+      soft_alert: '<span class="badge badge-warn">soft alert</span>',
+      hard_stop: '<span class="badge badge-bad">hard stop</span>',
+    }[snap.state] || ('<span class="badge" style="background:#555">' + snap.state + '</span>');
+    state.innerHTML = stateBadge;
+    const calls = cm.calls || [];
+    last.textContent = calls.length ? fmtPacific(calls[0].ts) : 'never';
   })();
 
   // Clear all dynamic regions so repeated polls don't accumulate duplicates.
@@ -586,11 +708,23 @@ function render(data) {
             </tbody>
           </table>`;
       if (w.edges.length > 0) {
-        html += `<details><summary style="cursor:pointer; font-size:12px; color:#666">Transitions (${w.edges.length})</summary><div style="margin-top:8px; font-size:12px">`;
+        const nodeById = {};
+        w.nodes.forEach(n => { nodeById[n.node_id] = n; });
+        const nodeChip = (id) => {
+          const n = nodeById[id];
+          if (!n) return `<span class="flow-node">${escapeHtml(id)}</span>`;
+          return `<span class="flow-node"><span class="pill pill-${n.cage_label}">`
+            + `${n.cage_label}</span>${escapeHtml(n.canonical_name)}</span>`;
+        };
+        html += `<div style="font-size:12px; color:#666; font-weight:600; margin:4px 0">`
+          + `Flow (${w.edges.length} transition${w.edges.length === 1 ? '' : 's'})</div>`;
+        html += `<div class="flow">`;
         w.edges.forEach(e => {
-          html += `<div>${escapeHtml(e.from_node)} → ${escapeHtml(e.to_node)} <span style="color:#888">×${e.observation_count}</span></div>`;
+          html += `<div class="flow-edge">${nodeChip(e.from_node)}`
+            + `<span class="flow-arrow">→</span>${nodeChip(e.to_node)}`
+            + `<span class="flow-count">×${e.observation_count}</span></div>`;
         });
-        html += `</div></details>`;
+        html += `</div>`;
       }
       html += `</div>`;
       wfc.innerHTML += html;
@@ -692,31 +826,79 @@ function render(data) {
     pip.innerHTML = html;
   }
 
-  // Cost
+  // Cost — two parts: live API spend (this run) + projected automation cost
   const ctc = document.getElementById('cost-content');
-  if (!data.cost_summary || data.cost_summary.length === 0) {
-    ctc.innerHTML = '<p class="empty">Cost rolls up per workflow once labels exist.</p>';
-  } else {
+  {
     let html = '';
-    data.cost_summary.forEach(w => {
-      html += `
-        <div style="background:#fff; border:1px solid #ddd; border-radius:6px; padding:16px; margin-bottom:16px">
-          <h2 style="margin:0 0 8px 0; font-size:16px">${escapeHtml(w.name)}</h2>
+
+    // Part 1 — live API spend: what it costs to ANALYSE the activity.
+    const cm = data.cost_monitor || {};
+    const snap = cm.snapshot;
+    html += '<h2 style="font-size:16px; margin:0 0 2px 0">API spend — this run</h2>';
+    html += '<div style="font-size:12px; color:#666; margin-bottom:8px">'
+      + 'What it costs to <i>analyse</i> the captured activity with Claude.</div>';
+    if (!snap) {
+      html += '<p class="empty">No API calls recorded yet.</p>';
+    } else {
+      const hourCls = snap.state === 'hard_stop' ? 'bad'
+        : (snap.state === 'soft_alert' ? 'warn' : '');
+      const runCls = snap.usd_total_run >= snap.total_spend_cap_usd ? 'bad' : '';
+      const stateBadge = {ok:'badge-ok', soft_alert:'badge-warn', hard_stop:'badge-bad'}[snap.state] || '';
+      html += '<div class="cost-tiles">';
+      html += `<div class="cost-tile ${runCls}"><div class="k">Run total</div>`
+        + `<div class="v">$${snap.usd_total_run.toFixed(2)}</div>`
+        + `<div class="sub">cap $${snap.total_spend_cap_usd.toFixed(0)} · ${snap.n_calls} call(s)</div></div>`;
+      html += `<div class="cost-tile ${hourCls}"><div class="k">Last hour</div>`
+        + `<div class="v">$${snap.usd_last_hour.toFixed(2)}</div>`
+        + `<div class="sub">soft $${snap.soft_alert_usd_per_hour.toFixed(0)} · `
+        + `hard $${snap.hard_stop_usd_per_hour.toFixed(0)}</div></div>`;
+      html += `<div class="cost-tile ${hourCls}"><div class="k">Cost state</div>`
+        + `<div class="v"><span class="badge ${stateBadge}">${snap.state.replace('_',' ')}</span></div>`
+        + `<div class="sub">${snap.reason ? escapeHtml(snap.reason) : 'within budget'}</div></div>`;
+      html += '</div>';
+      const calls = cm.calls || [];
+      if (calls.length) {
+        html += '<table style="margin-bottom:6px"><thead><tr><th>Time</th><th>Model</th>'
+          + '<th>Session</th><th class="num">In tok</th><th class="num">Out tok</th>'
+          + '<th class="num">USD</th></tr></thead><tbody>';
+        calls.forEach(c => {
+          html += `<tr><td>${escapeHtml(fmtPacific(c.ts))}</td><td>${escapeHtml(c.model)}</td>`
+            + `<td>${escapeHtml(c.session_id || '—')}</td>`
+            + `<td class="num">${c.input_tokens.toLocaleString()}</td>`
+            + `<td class="num">${c.output_tokens.toLocaleString()}</td>`
+            + `<td class="num">$${c.usd_cost.toFixed(4)}</td></tr>`;
+        });
+        html += '</tbody></table>';
+        if (cm.calls_total > calls.length) {
+          html += `<div style="font-size:11px; color:#888; margin-bottom:8px">`
+            + `Showing ${calls.length} most recent of ${cm.calls_total} calls.</div>`;
+        }
+      }
+    }
+
+    // Part 2 — projected automation cost: what it would cost to REPLACE the work.
+    html += '<h2 style="font-size:16px; margin:24px 0 2px 0">Projected automation cost</h2>';
+    html += '<div style="font-size:12px; color:#666; margin-bottom:8px">'
+      + 'Estimated agent tokens to <i>automate</i> one execution of each workflow.</div>';
+    if (!data.cost_summary || data.cost_summary.length === 0) {
+      html += '<p class="empty">Rolls up per workflow once labels exist.</p>';
+    } else {
+      data.cost_summary.forEach(w => {
+        html += `<div style="background:#fff; border:1px solid #ddd; border-radius:6px; padding:16px; margin-bottom:16px">
+          <h3 style="margin:0 0 8px 0; font-size:15px">${escapeHtml(w.name)}</h3>
           <div style="font-size:13px; color:#444; margin-bottom:8px">
-            One execution of this workflow ≈ <b>${w.per_execution_tokens.toLocaleString()}</b> agent tokens
-            across ${w.node_count} action(s).
+            One execution ≈ <b>${w.per_execution_tokens.toLocaleString()}</b> agent tokens across ${w.node_count} action(s).
           </div>
-          <table>
-            <thead><tr><th>CAGE</th><th class="num">Tokens per execution</th></tr></thead>
-            <tbody>`;
-      ['C','A','G','E'].forEach(k => {
-        const v = w.cage_breakdown[k] || 0;
-        if (v === 0) return;
-        const names = {C:'Capture', A:'Analyze', G:'Generate', E:'Extract'};
-        html += `<tr><td><span class="pill pill-${k}">${k}</span> ${names[k]}</td><td class="num">${v.toLocaleString()}</td></tr>`;
+          <table><thead><tr><th>CAGE</th><th class="num">Tokens per execution</th></tr></thead><tbody>`;
+        ['C','A','G','E'].forEach(k => {
+          const v = w.cage_breakdown[k] || 0;
+          if (v === 0) return;
+          const names = {C:'Capture', A:'Analyze', G:'Generate', E:'Extract'};
+          html += `<tr><td><span class="pill pill-${k}">${k}</span> ${names[k]}</td><td class="num">${v.toLocaleString()}</td></tr>`;
+        });
+        html += `</tbody></table></div>`;
       });
-      html += `</tbody></table></div>`;
-    });
+    }
     ctc.innerHTML = html;
   }
 

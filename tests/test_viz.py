@@ -96,6 +96,59 @@ def test_render_produces_self_contained_html(tmp_path: Path) -> None:
     assert "Open thing" in data_json
 
 
+def test_render_includes_cost_monitor_payload(tmp_path: Path) -> None:
+    """The viz payload carries a cost-monitor snapshot + per-call history."""
+    import json
+
+    store = Store(tmp_path / "data")
+    # Two API calls — one Sonnet, one Opus.
+    store.insert_api_call(
+        call_id="c1",
+        ts=T0,
+        model="claude-sonnet-4-6",
+        input_tokens=30_000,
+        output_tokens=4_000,
+        usd_cost=0.15,
+        session_id="s1",
+    )
+    store.insert_api_call(
+        call_id="c2",
+        ts=T0 + timedelta(minutes=1),
+        model="claude-opus-4-7",
+        input_tokens=30_000,
+        output_tokens=4_000,
+        usd_cost=0.75,
+        session_id="s2",
+    )
+
+    render(store, tmp_path / "viz")
+    data = json.loads((tmp_path / "viz" / "data.json").read_text(encoding="utf-8"))
+
+    cm = data["cost_monitor"]
+    assert cm["snapshot"] is not None
+    assert cm["snapshot"]["n_calls"] == 2
+    # Total run spend = 0.15 + 0.75 = 0.90
+    assert cm["snapshot"]["usd_total_run"] == 0.9
+    assert cm["calls_total"] == 2
+    # Newest call first.
+    assert cm["calls"][0]["model"] == "claude-opus-4-7"
+    assert cm["calls"][1]["model"] == "claude-sonnet-4-6"
+
+
+def test_render_cost_monitor_empty_when_no_calls(tmp_path: Path) -> None:
+    """No api_calls -> a valid snapshot with zero spend, no crash."""
+    import json
+
+    store = Store(tmp_path / "data")
+    render(store, tmp_path / "viz")
+    data = json.loads((tmp_path / "viz" / "data.json").read_text(encoding="utf-8"))
+
+    cm = data["cost_monitor"]
+    assert cm["snapshot"]["n_calls"] == 0
+    assert cm["snapshot"]["usd_total_run"] == 0
+    assert cm["calls"] == []
+
+
 _TINY_PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
     "890000000d49444154789c63000100000005000156a4fa720000000049454e44"
