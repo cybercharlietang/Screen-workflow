@@ -90,6 +90,7 @@ class SessionCloseReason(str, Enum):
     DURATION_CAP = "duration_cap"
     IDLE_GAP = "idle_gap"
     CONTEXT_SHIFT = "context_shift"
+    BUFFER_FLUSH = "buffer_flush"  # rolling flush: N events or T seconds reached
 
 
 class Session(BaseModel):

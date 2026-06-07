@@ -27,7 +27,10 @@ from pathlib import Path
 from screen_workflow.capture.daemon import Daemon
 from screen_workflow.cost_monitor import CostMonitor
 from screen_workflow.labeler.api import process_session
-from screen_workflow.session.segmenter import segment_and_persist_incremental
+from screen_workflow.session.segmenter import (
+    SegmenterConfig,
+    segment_and_persist_incremental,
+)
 from screen_workflow.storage.db import Store
 from screen_workflow.viz.report import render
 
@@ -37,6 +40,12 @@ RERENDER_INTERVAL_SECONDS = 30.0
 SEGMENTER_INTERVAL_SECONDS = 30.0
 LABELER_INTERVAL_SECONDS = 60.0
 DEFAULT_LABELER_MODEL = "claude-sonnet-4-6"
+
+# Rolling flush for live mode: close (and hand to the labeler) a session after
+# this much accumulated activity, regardless of idle — so a continuously-busy
+# machine gets steady feedback instead of waiting out the 30-min duration cap.
+FLUSH_MAX_EVENTS = 40
+FLUSH_MAX_SECONDS = 300.0
 
 
 def _rerender_loop(root: Path, out_dir: Path, stop: threading.Event) -> None:
@@ -55,15 +64,19 @@ def _segmenter_loop(root: Path, stop: threading.Event) -> None:
     ended. On shutdown, force-flush the open trailing session so it is not
     lost."""
     store = Store(root)
+    cfg = SegmenterConfig(
+        flush_max_events=FLUSH_MAX_EVENTS,
+        flush_max_seconds=FLUSH_MAX_SECONDS,
+    )
     try:
         while not stop.wait(SEGMENTER_INTERVAL_SECONDS):
             try:
-                segment_and_persist_incremental(store)
+                segment_and_persist_incremental(store, cfg)
             except Exception:  # noqa: BLE001 — keep the loop alive
                 log.exception("segmenter tick failed")
     finally:
         try:
-            flushed = segment_and_persist_incremental(store, force=True)
+            flushed = segment_and_persist_incremental(store, cfg, force=True)
             if flushed:
                 log.info("segmenter: flushed %d open session(s) on shutdown", len(flushed))
         except Exception:  # noqa: BLE001
@@ -275,12 +288,14 @@ def main(argv: list[str] | None = None) -> int:
     # labeler costs money and needs a key, so it has more ways to be off.
     labeler_enabled = not args.no_daemon and not args.no_labeler
     labeler_status = args.labeler_model
+    key_missing = False
     if args.no_daemon:
         labeler_status = "DISABLED (view-only mode)"
     elif args.no_labeler:
         labeler_status = "DISABLED (--no-labeler)"
     elif not os.environ.get("ANTHROPIC_API_KEY"):
         labeler_enabled = False
+        key_missing = True
         labeler_status = "DISABLED (ANTHROPIC_API_KEY not set)"
         log.warning(
             "ANTHROPIC_API_KEY is not set — labeler disabled; capture + "
@@ -331,6 +346,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(f"  Capturing to:            {root.resolve()}")
         print(f"  Segmenter:               every {SEGMENTER_INTERVAL_SECONDS:.0f}s")
+        print(f"  Flush to labeler:        every {FLUSH_MAX_EVENTS} events "
+              f"or {FLUSH_MAX_SECONDS:.0f}s of activity")
     print(f"  Re-rendering every:      {RERENDER_INTERVAL_SECONDS:.0f}s")
     print(f"  Labeler:                 {labeler_status}")
     if labeler_enabled:
@@ -339,6 +356,18 @@ def main(argv: list[str] | None = None) -> int:
     print("  Press Ctrl+C to stop.")
     print("=" * 60)
     print()
+
+    if key_missing:
+        bar = "!" * 60
+        print(bar)
+        print("!!  ANTHROPIC_API_KEY is NOT set  —  NO LABELING WILL HAPPEN")
+        print("!!")
+        print("!!  Capture + segmentation will run, but no API calls are")
+        print("!!  made, so NO workflows will be discovered. Set the key,")
+        print("!!  open a NEW shell, and re-run:")
+        print('!!    [Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY","sk-ant-...","User")')
+        print(bar)
+        print()
 
     if not args.no_browser:
         try:

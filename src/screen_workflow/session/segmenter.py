@@ -31,6 +31,13 @@ class SegmenterConfig:
     duration_cap: timedelta = timedelta(minutes=30)
     idle_gap_seconds: float = 120.0
     max_events: int = 300
+    # Rolling flush (opt-in; live mode only). When set, a session closes after
+    # this many events or this many seconds of activity *regardless of idle* —
+    # so a continuously-busy machine still flushes to the labeler on a steady
+    # cadence instead of waiting out the 30-min duration cap. Both None => the
+    # classic behavior (close only on idle gap / duration cap / max events).
+    flush_max_events: int | None = None
+    flush_max_seconds: float | None = None
 
 
 def _close_reason(
@@ -41,6 +48,15 @@ def _close_reason(
     n_events: int,
 ) -> SessionCloseReason | None:
     """Return a close reason if the session should end now, else None."""
+    # Rolling flush fires first (its thresholds are smaller than the safety
+    # caps below), but only when enabled.
+    if cfg.flush_max_events is not None and n_events >= cfg.flush_max_events:
+        return SessionCloseReason.BUFFER_FLUSH
+    if (
+        cfg.flush_max_seconds is not None
+        and (last - start).total_seconds() >= cfg.flush_max_seconds
+    ):
+        return SessionCloseReason.BUFFER_FLUSH
     if n_events >= cfg.max_events:
         return SessionCloseReason.CONTEXT_SHIFT  # reuse this enum for "cap hit"
     if (last - start) >= cfg.duration_cap:

@@ -138,6 +138,46 @@ def test_incremental_force_flushes_open_trailing_bucket() -> None:
     assert sessions[0].event_ids == ["e_000", "e_001", "e_002"]
 
 
+# ---------------------------------------------------------------------------
+# Rolling flush (opt-in)
+# ---------------------------------------------------------------------------
+
+
+def test_flush_disabled_by_default_keeps_busy_session_whole() -> None:
+    """With no flush configured, a long continuously-busy run stays one session
+    until the duration cap — the classic behavior."""
+    events = [_e(i, i * 5.0) for i in range(20)]  # 95s span, 5s apart, no idle
+    sessions = segment(events, SegmenterConfig(idle_gap_seconds=120))
+    assert len(sessions) == 1
+
+
+def test_flush_by_event_count() -> None:
+    events = [_e(i, i * 1.0) for i in range(25)]  # 1s apart, no idle gap
+    sessions = segment(events, SegmenterConfig(flush_max_events=10))
+    assert [len(s.event_ids) for s in sessions] == [10, 10, 5]
+    assert sessions[0].close_reason is SessionCloseReason.BUFFER_FLUSH
+
+
+def test_flush_by_elapsed_seconds() -> None:
+    # Events 60s apart, no idle gap (<120s). 5-min flush closes every 5 events.
+    events = [_e(i, i * 60.0) for i in range(12)]
+    sessions = segment(events, SegmenterConfig(flush_max_seconds=300))
+    assert sessions[0].close_reason is SessionCloseReason.BUFFER_FLUSH
+    # first session spans 0..300s -> 6 events (indices 0..5)
+    assert len(sessions[0].event_ids) == 6
+
+
+def test_incremental_flush_closes_recent_busy_bucket() -> None:
+    """The live-mode case: a trailing bucket that is still active (recent last
+    event, no idle) closes once it crosses the flush threshold."""
+    events = [_e(i, i * 5.0) for i in range(12)]  # 55s span, 5s apart
+    now = events[-1].ts + timedelta(seconds=2)  # very recent — not idle
+    cfg = SegmenterConfig(flush_max_events=5, idle_gap_seconds=120)
+    sessions = segment_incremental(events, cfg, now)
+    assert [len(s.event_ids) for s in sessions] == [5, 5]  # final 2 stay open
+    assert sessions[0].close_reason is SessionCloseReason.BUFFER_FLUSH
+
+
 def test_incremental_empty_input() -> None:
     assert segment_incremental([], CFG, T0) == []
 
