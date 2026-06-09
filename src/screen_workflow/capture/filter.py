@@ -35,8 +35,28 @@ class FilterResult:
 SKIP = FilterResult(keep=False)
 
 
-def classify(event: RawEvent) -> FilterResult:
-    """Decide whether the capture daemon should grab a screenshot."""
+def is_text_input(event: RawEvent) -> bool:
+    """True if this event is a single printable character being typed.
+
+    The daemon uses this to track 'typing flow' so it can tell a deliberate
+    Enter (submit) from an Enter that's just a newline mid-sentence. Modifier
+    chords (Ctrl+V etc.) and named keys (enter, backspace, tab) are not text.
+    """
+    return (
+        event.kind == "key"
+        and event.is_pressed
+        and event.key is not None
+        and len(event.key) == 1
+        and not (event.modifiers & {"ctrl", "cmd"})
+    )
+
+
+def classify(event: RawEvent, *, typing_active: bool = False) -> FilterResult:
+    """Decide whether the capture daemon should grab a screenshot.
+
+    ``typing_active`` is set by the daemon when a printable character was typed
+    in the last second; it down-weights a bare Enter from SUBMIT to a newline.
+    """
     match event.kind:
         case "heartbeat":
             return FilterResult(keep=True, trigger=TriggerType.HEARTBEAT)
@@ -47,6 +67,11 @@ def classify(event: RawEvent) -> FilterResult:
                 target_label=event.target_label,
             )
         case "url_change":
+            # Wired end-to-end (filter + dedupe) but NOT currently emitted: no
+            # event source produces "url_change" yet. Browser navigations are
+            # only caught when the window *title* changes (window_focus). True
+            # in-page (SPA) URL changes are missed until we add a browser hook
+            # — see TODOS.md "Browser extension for URL fidelity".
             return FilterResult(
                 keep=True,
                 trigger=TriggerType.URL_CHANGE,
@@ -63,11 +88,11 @@ def classify(event: RawEvent) -> FilterResult:
                 target_label=event.target_label,
             )
         case "key":
-            return _classify_key(event)
+            return _classify_key(event, typing_active=typing_active)
     return SKIP
 
 
-def _classify_key(event: RawEvent) -> FilterResult:
+def _classify_key(event: RawEvent, *, typing_active: bool = False) -> FilterResult:
     if not event.is_pressed or event.key is None:
         return SKIP
     key = event.key.lower()
@@ -86,6 +111,10 @@ def _classify_key(event: RawEvent) -> FilterResult:
             return FilterResult(keep=True, trigger=TriggerType.FILE_OPEN)
 
     if key in {"enter", "return"}:
+        # Enter mid-typing is a newline, not a submit — skip it. A deliberate
+        # submit (search box, form) usually follows a pause or a paste.
+        if typing_active and not mods:
+            return SKIP
         return FilterResult(
             keep=True,
             trigger=TriggerType.SUBMIT,

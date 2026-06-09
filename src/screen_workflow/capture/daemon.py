@@ -32,7 +32,7 @@ from screen_workflow.capture.dedupe import (
     HASH_MODES,
     Deduper,
 )
-from screen_workflow.capture.filter import RawEvent, classify
+from screen_workflow.capture.filter import RawEvent, classify, is_text_input
 from screen_workflow.schemas import Event, InputEvent, TriggerType
 from screen_workflow.storage.db import Store
 
@@ -46,6 +46,9 @@ ACTIVE_WINDOW_POLL_SECONDS = 1.0
 # A second click before the deadline resets it, collapsing a rapid burst into
 # one capture of the final settled state.
 CLICK_SETTLE_SECONDS = 0.35
+# A bare Enter within this long of a printable keystroke is treated as a
+# newline (typing flow), not a deliberate SUBMIT.
+TYPING_WINDOW_SECONDS = 1.0
 
 
 def _now() -> datetime:
@@ -221,6 +224,7 @@ class Daemon:
         # A click whose screenshot is deferred until the UI settles:
         # (trigger, target_label, monotonic deadline). Coalesces rapid clicks.
         self._pending_click: tuple[TriggerType, str | None, float] | None = None
+        self._last_text_at = -1e9  # monotonic time of the last printable keystroke
         self._last_app_title: tuple[str, str] | None = None
         self._status_path = self.store.root / "_status.json"
         self._events_captured = 0
@@ -313,7 +317,10 @@ class Daemon:
                     raw = self.raw_q.get(timeout=0.1)
                 except queue.Empty:
                     continue
-                result = classify(raw)
+                if is_text_input(raw):
+                    self._last_text_at = time.monotonic()
+                typing_active = (time.monotonic() - self._last_text_at) < TYPING_WINDOW_SECONDS
+                result = classify(raw, typing_active=typing_active)
                 if not result.keep or result.trigger is None:
                     continue
                 if result.trigger is TriggerType.CLICK:

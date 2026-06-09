@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from screen_workflow.capture.filter import RawEvent, classify
+from screen_workflow.capture.filter import RawEvent, classify, is_text_input
 from screen_workflow.schemas import TriggerType
 
 
@@ -47,6 +47,31 @@ class TestKeepers:
     def test_submit_keys(self, key: str) -> None:
         r = classify(E("key", key=key))
         assert r.keep and r.trigger is TriggerType.SUBMIT
+
+
+class TestEnterPrecision:
+    def test_enter_while_typing_is_newline_skipped(self) -> None:
+        # Enter right after typing characters -> newline, not submit.
+        assert not classify(E("key", key="enter"), typing_active=True).keep
+
+    def test_enter_after_pause_is_submit(self) -> None:
+        r = classify(E("key", key="enter"), typing_active=False)
+        assert r.keep and r.trigger is TriggerType.SUBMIT
+
+    def test_ctrl_enter_submits_even_while_typing(self) -> None:
+        # Ctrl+Enter (Outlook/Teams "send") is always a deliberate submit.
+        r = classify(
+            E("key", key="enter", modifiers=frozenset({"ctrl"})), typing_active=True
+        )
+        assert r.keep and r.trigger is TriggerType.SUBMIT
+
+    def test_is_text_input_classification(self) -> None:
+        assert is_text_input(E("key", key="a")) is True
+        assert is_text_input(E("key", key="5")) is True
+        assert is_text_input(E("key", key="enter")) is False  # named key, len > 1
+        assert is_text_input(E("key", key="v", modifiers=frozenset({"ctrl"}))) is False
+        assert is_text_input(E("key", key="a", is_pressed=False)) is False
+        assert is_text_input(E("mouse_click", button="left")) is False
 
 
 class TestSkippers:
