@@ -41,15 +41,68 @@ class TestHeartbeat:
         assert d.should_keep(_noisy(99), TriggerType.HEARTBEAT) is True
 
 
-class TestAlwaysKeep:
-    def test_window_focus_always_kept(self) -> None:
+SEP = "␟"  # window_key separator the daemon uses: f"{app}{SEP}{title}"
+
+
+class TestContextFrames:
+    def test_app_switch_always_kept(self) -> None:
+        """Switching apps is a real context shift — kept even if visually similar."""
         d = Deduper()
-        d.should_keep(_solid((50, 50, 50)), TriggerType.WINDOW_FOCUS, "w1")
-        assert d.should_keep(_solid((50, 50, 50)), TriggerType.WINDOW_FOCUS, "w1") is True
+        d.should_keep(_solid((50, 50, 50)), TriggerType.WINDOW_FOCUS, f"OUTLOOK.EXE{SEP}Inbox")
+        assert (
+            d.should_keep(_solid((50, 50, 50)), TriggerType.WINDOW_FOCUS, f"CHROME.EXE{SEP}SAP")
+            is True
+        )
+
+    def test_title_flap_same_app_dropped(self) -> None:
+        """Same app, title-only change, unchanged pixels (e.g. unread counter
+        Inbox (3) -> Inbox (4)) is pure flap and dropped."""
+        d = Deduper()
+        d.should_keep(_solid((50, 50, 50)), TriggerType.WINDOW_FOCUS, f"OUTLOOK.EXE{SEP}Inbox (3)")
+        assert (
+            d.should_keep(_solid((50, 50, 50)), TriggerType.WINDOW_FOCUS, f"OUTLOOK.EXE{SEP}Inbox (4)")
+            is False
+        )
+
+    def test_title_change_with_visual_change_kept(self) -> None:
+        """Same app but the screen actually changed — real signal, kept."""
+        d = Deduper()
+        d.should_keep(_noisy(1), TriggerType.WINDOW_FOCUS, f"CHROME.EXE{SEP}Page A")
+        assert (
+            d.should_keep(_noisy(50), TriggerType.WINDOW_FOCUS, f"CHROME.EXE{SEP}Page B") is True
+        )
+
+    def test_url_change_always_kept(self) -> None:
+        d = Deduper()
+        d.should_keep(_solid((50, 50, 50)), TriggerType.URL_CHANGE, f"CHROME.EXE{SEP}A")
+        assert (
+            d.should_keep(_solid((50, 50, 50)), TriggerType.URL_CHANGE, f"CHROME.EXE{SEP}A") is True
+        )
 
     def test_submit_always_kept(self) -> None:
         d = Deduper()
         assert d.should_keep(_solid((50, 50, 50)), TriggerType.SUBMIT, "w1") is True
+
+
+class TestRingBuffer:
+    def test_aba_flip_drops_returning_frame(self) -> None:
+        """A->B->A: the returning frame matches a hash 2-back and is dropped,
+        where a single-last-frame check would have kept it."""
+        d = Deduper(heartbeat_threshold=5)
+        a, b = _noisy(1), _noisy(2)
+        assert d.should_keep(a, TriggerType.HEARTBEAT) is True
+        assert d.should_keep(b, TriggerType.HEARTBEAT) is True
+        assert d.should_keep(a, TriggerType.HEARTBEAT) is False  # ring buffer catches it
+
+    def test_frame_older_than_window_is_not_deduped(self) -> None:
+        """Once a frame ages out of the recent window, an identical frame is
+        kept again (bounded memory)."""
+        d = Deduper(heartbeat_threshold=5, recent_window=2)
+        a = _noisy(1)
+        assert d.should_keep(a, TriggerType.HEARTBEAT) is True
+        d.should_keep(_noisy(2), TriggerType.HEARTBEAT)
+        d.should_keep(_noisy(3), TriggerType.HEARTBEAT)  # a now evicted (maxlen=2)
+        assert d.should_keep(a, TriggerType.HEARTBEAT) is True
 
 
 class TestMutationDedup:
