@@ -359,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Screen-workflow {mode}  ->  {url}")
     print(f"  Reading from:            {root.resolve()}")
     if args.no_daemon:
-        print(f"  Capture daemon:          DISABLED (--no-daemon)")
+        print("  Capture daemon:          DISABLED (--no-daemon)")
     else:
         print(f"  Capturing to:            {root.resolve()}")
         print(f"  Segmenter:               every {SEGMENTER_INTERVAL_SECONDS:.0f}s")

@@ -409,7 +409,6 @@ def merge_response(
                 continue
 
             node_id = str(raw["node_id"])
-            is_new = bool(raw.get("is_new_node", node_id not in wf.nodes))
             if node_id not in wf.nodes:
                 wf.nodes[node_id] = WorkflowNode(
                     node_id=node_id,

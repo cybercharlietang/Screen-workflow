@@ -39,14 +39,12 @@ MAX_FRAMES_PER_SESSION = 80
 # and give Claude more discrete mental-model-update steps. Tune up if
 # rate-limited / latency-sensitive on larger sessions.
 MAX_CHUNK_PAYLOAD_BYTES = 10 * 1024 * 1024   # ~10 MB of base64-encoded images
-# Anthropic's "many-image request" 2000px-per-side rule appears to kick in
-# above ~8-10 images per call. Staying under that lets us keep most
-# screenshots at full PNG resolution. Tune up only if rate-limited.
+# Keep chunks small (~6 images) so each call is fast, fails cheaply, and gives
+# Claude more discrete mental-model-update steps. Tune up only if rate-limited.
 MAX_IMAGES_PER_CHUNK = 6
 
-# Anthropic also caps EACH image at 5 MB. We give ourselves headroom and
-# only down-encode images that exceed this — smaller PNGs pass through
-# at full quality.
+# Anthropic caps EACH image at 5 MB; we leave headroom and re-encode anything
+# above this (see _shrink_for_anthropic).
 MAX_PER_IMAGE_BYTES = 4 * 1024 * 1024
 # Default long-edge cap we downscale every screenshot to before sending.
 # Anthropic internally scales any image down to ~1568 px / ~1.15 MP before
