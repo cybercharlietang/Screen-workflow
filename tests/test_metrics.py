@@ -38,6 +38,8 @@ def _seed(store: Store) -> None:
         call_id="c1", ts=T0, model="claude-sonnet-4-6", session_id="s1",
         input_tokens=10_000, output_tokens=2_000, usd_cost=0.06,
     )
+    # labeled 90s after T0; session closed at T0+30s -> 60s labeling latency
+    store.mark_session_labeled("s1", labeled_at=T0 + timedelta(seconds=90))
 
 
 def _write_audit(audit_dir: Path) -> None:
@@ -47,6 +49,8 @@ def _write_audit(audit_dir: Path) -> None:
             "claude_response": {
                 "actions": [
                     {"target_workflow_kind": "new", "confidence": 0.9},
+                    {"target_workflow_kind": "existing", "confidence": 0.95},
+                    {"target_workflow_kind": "existing", "confidence": 0.6},  # low-conf
                     {"target_workflow_kind": "noise", "confidence": 0.8},
                 ]
             }
@@ -70,13 +74,18 @@ def test_build_and_write_run_summary(tmp_path: Path) -> None:
     )
     store.close()
 
+    lab = summary["labeling"]
     assert summary["capture"]["frames_kept"] == 4
+    assert summary["capture"]["frames_by_trigger"] == {"click": 4}
     assert summary["sessions"]["by_close_reason"] == {"buffer_flush": 1}
-    assert summary["labeling"]["api_calls"] == 1
-    assert summary["labeling"]["actions_total"] == 2
-    assert summary["labeling"]["actions_noise"] == 1
-    assert summary["labeling"]["noise_ratio"] == 0.5
-    assert summary["labeling"]["avg_confidence"] == 0.85
+    assert lab["api_calls"] == 1
+    assert lab["actions_total"] == 4
+    assert lab["actions_noise"] == 1
+    assert lab["noise_ratio"] == 0.25
+    assert lab["reuse_rate"] == round(2 / 3, 3)        # 2 existing / (2 existing + 1 new)
+    assert lab["low_confidence_actions"] == 1          # the 0.6 action
+    assert lab["low_confidence_ratio"] == 0.25
+    assert summary["sessions"]["labeling_latency"]["median_s"] == 60.0
     assert summary["cost"]["usd_total"] == 0.06
     assert summary["cost"]["usd_per_hour"] == 0.06  # 1-hour run
 
@@ -84,4 +93,5 @@ def test_build_and_write_run_summary(tmp_path: Path) -> None:
     path = write_run_summary(summary, runs, stamp="20260609T130000Z")
     assert path.exists()
     line = json.loads((runs / "runs.jsonl").read_text().strip())
-    assert line["frames"] == 4 and line["usd"] == 0.06 and line["noise_ratio"] == 0.5
+    assert line["frames"] == 4 and line["usd"] == 0.06 and line["noise_ratio"] == 0.25
+    assert line["reuse_rate"] == round(2 / 3, 3) and line["label_latency_s"] == 60.0

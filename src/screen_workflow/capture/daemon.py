@@ -285,6 +285,7 @@ class Daemon:
                 "started_at": self._started_at.isoformat() if self._started_at else None,
                 "heartbeat_ts": _now().isoformat(),
                 "last_error": last_error,
+                "dedup": self.deduper.stats(),  # persisted so keep-rate survives post-hoc
             }
             self._status_path.write_text(json.dumps(payload), encoding="utf-8")
         except Exception:  # noqa: BLE001

@@ -340,6 +340,16 @@ class Store:
             for row in self._conn.execute("SELECT session_id FROM labeled_sessions")
         }
 
+    def labeled_session_times(self) -> dict[str, datetime]:
+        """{session_id: labeled_at} — for labeling-latency metrics."""
+        out: dict[str, datetime] = {}
+        for row in self._conn.execute("SELECT session_id, labeled_at FROM labeled_sessions"):
+            try:
+                out[row[0]] = datetime.fromisoformat(row[1])
+            except Exception:
+                continue
+        return out
+
     # -- lifecycle ---------------------------------------------------------
 
     def close(self) -> None:
