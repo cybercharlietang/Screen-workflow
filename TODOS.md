@@ -204,3 +204,28 @@ These were intentionally cut for PoC scope. Revisit when going to pilot:
 - [x] Initial design conversation and pipeline shape — captured in
       `SPEC.md` and `LESSONS.md`.
 - [x] Repo scaffold.
+
+### Prototype-hardening pass (2026-06-09)
+
+- [x] Continuous live pipeline: capture + segment + label + viz in one
+      process, with cost monitor (soft/hard/cap guards) + loud no-key alert.
+- [x] Rolling flush: sessions flush to the labeler every 40 events / 5 min
+      regardless of idle (decoupled from session semantics).
+- [x] Dedup: recent-hash ring buffer (kills A→B→A), window-focus title-flap
+      gate, switchable `--hash-mode perceptual|exact` + stats instrumentation.
+- [x] Triggers: click capture-after-settle, Enter=submit typing-precision,
+      **new-window / dialog-open trigger** (decision points, always kept).
+- [x] `--max-image-px` knob (default 1568; below that cuts image tokens) —
+      replaces the deferred `--compress` item.
+- [x] Per-run metrics: `runs/run_<stamp>.json` + `runs.jsonl` for cross-run
+      comparison (`analytics/metrics.py`).
+- [x] Key handling: gitignored `.env` auto-load + double-click `start.bat`.
+
+### Next (post-baseline)
+
+- [ ] Re-run with the new dedup + measure frame-count/cost delta vs L17 baseline.
+- [ ] Trim output JSON verbosity (~29% of cost) and per-call overhead (~40%).
+- [ ] Clipboard-change trigger (data-source lineage); content capture is
+      redaction-gated.
+- [ ] Novelty/semantic dedup (suppress model-redundant frames vs stable
+      nodes) — deferred until baseline shows the redundancy is there to harvest.

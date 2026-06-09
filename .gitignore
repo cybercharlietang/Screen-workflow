@@ -42,6 +42,7 @@ events.db-journal
 *.db-shm
 *.db-wal
 local_data/
+runs/
 secrets/
 .env
 .env.local

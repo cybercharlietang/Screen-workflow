@@ -27,6 +27,7 @@ from pathlib import Path
 from screen_workflow.capture.daemon import Daemon
 from screen_workflow.cost_monitor import CostMonitor
 from screen_workflow.labeler.api import process_session
+from screen_workflow.analytics.metrics import build_run_summary, write_run_summary
 from screen_workflow.session.segmenter import (
     SegmenterConfig,
     segment_and_persist_incremental,
@@ -99,6 +100,7 @@ def _labeler_loop(
     cap: float,
     run_started_at: datetime,
     stop: threading.Event,
+    max_image_px: int,
 ) -> None:
     """Streaming labeler: every tick, label any closed-and-unlabeled session.
 
@@ -127,7 +129,8 @@ def _labeler_loop(
                     break
                 log.info("labeler: processing session %s", session.session_id)
                 process_session(
-                    store, session, model=model, cost_monitor=monitor
+                    store, session, model=model, cost_monitor=monitor,
+                    max_image_px=max_image_px,
                 )
                 store.mark_session_labeled(session.session_id)
         except Exception:  # noqa: BLE001 — keep the loop alive on API/transient errors
@@ -254,6 +257,13 @@ def main(argv: list[str] | None = None) -> int:
         default="perceptual",
         help="frame dedupe: perceptual hash (cheaper, not exact) or exact pixels",
     )
+    p.add_argument(
+        "--max-image-px",
+        type=int,
+        default=1568,
+        help="downscale screenshots to this long-edge px before sending "
+        "(1568=free; lower cuts tokens at the cost of small-text legibility)",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
@@ -335,6 +345,7 @@ def main(argv: list[str] | None = None) -> int:
                     "cap": args.total_spend_cap_usd,
                     "run_started_at": run_started_at,
                     "stop": stop,
+                    "max_image_px": args.max_image_px,
                 },
                 daemon=True,
             )
@@ -355,6 +366,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Flush to labeler:        every {FLUSH_MAX_EVENTS} events "
               f"or {FLUSH_MAX_SECONDS:.0f}s of activity")
         print(f"  Frame dedupe:            {args.hash_mode} hash")
+    if labeler_enabled:
+        print(f"  Max image px:            {args.max_image_px} (long edge)")
     print(f"  Re-rendering every:      {RERENDER_INTERVAL_SECONDS:.0f}s")
     print(f"  Labeler:                 {labeler_status}")
     if labeler_enabled:
@@ -407,7 +420,44 @@ def main(argv: list[str] | None = None) -> int:
                 f"  {pending} session(s) captured but not labeled. "
                 f"Run `screen-workflow-label --root {args.root}` to process them."
             )
+        _write_run_summary_safe(root, daemon, run_started_at, args, labeler_enabled)
     return 0
+
+
+def _write_run_summary_safe(root, daemon, run_started_at, args, labeler_enabled) -> None:
+    """Persist a per-run metrics summary; never let it break shutdown."""
+    try:
+        ended = datetime.now(timezone.utc)
+        store = Store(root)
+        try:
+            summary = build_run_summary(
+                store=store,
+                audit_dir=root / "audit",
+                dedup_stats=(daemon.deduper.stats() if daemon is not None else {}),
+                config={
+                    "hash_mode": args.hash_mode,
+                    "max_image_px": args.max_image_px,
+                    "labeler_model": args.labeler_model,
+                    "labeler_enabled": labeler_enabled,
+                },
+                started_at=run_started_at,
+                ended_at=ended,
+            )
+        finally:
+            store.close()
+        stamp = ended.strftime("%Y%m%dT%H%M%SZ")
+        path = write_run_summary(summary, root.parent / "runs", stamp=stamp)
+        cost = summary["cost"]
+        lab = summary["labeling"]
+        cap = summary["capture"]
+        print(f"  run summary -> {path}")
+        print(
+            f"  frames={cap['frames_kept']} keep_rate={cap['dedup'].get('keep_rate')} "
+            f"calls={lab['api_calls']} cost=${cost['usd_total']:.4f} "
+            f"(${cost['usd_per_hour']:.2f}/hr) noise_ratio={lab.get('noise_ratio')}"
+        )
+    except Exception:
+        log.exception("run summary failed")
 
 
 def _shutdown_pending_count(root: Path) -> int:

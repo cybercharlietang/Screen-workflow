@@ -87,6 +87,41 @@ def _make_active_window_probe() -> Callable[[], tuple[str, str]]:
         return lambda: ("unknown", "")
 
 
+def _make_window_lister() -> Callable[[], dict[str, str]]:
+    """Return a function mapping {stable_window_id: title} for all titled
+    top-level windows. Identity is the OS window handle when available (stable
+    across title changes), else the title itself. Empty-title windows (most
+    tooltips/popups) are skipped. Degrades to an empty map off-Windows."""
+    try:
+        import pywinctl  # type: ignore
+
+        def lister() -> dict[str, str]:
+            out: dict[str, str] = {}
+            try:
+                for w in pywinctl.getAllWindows():
+                    title = (getattr(w, "title", "") or "").strip()
+                    if not title:
+                        continue
+                    try:
+                        wid = str(w.getHandle())
+                    except Exception:
+                        wid = "t:" + title
+                    out[wid] = title
+            except Exception:
+                return {}
+            return out
+
+        return lister
+    except Exception:
+        log.warning("pywinctl unavailable; new-window/dialog detection disabled")
+        return lambda: {}
+
+
+def new_windows(prev: set[str], cur: set[str]) -> set[str]:
+    """Window identities present now but not on the previous poll."""
+    return cur - prev
+
+
 # ---------------------------------------------------------------------------
 # Screenshot grabber
 # ---------------------------------------------------------------------------
@@ -219,6 +254,8 @@ class Daemon:
         self.shotter = Screenshotter(self.store.screens_dir)
         self.deduper = Deduper(hash_mode=hash_mode)
         self.probe = _make_active_window_probe()
+        self.window_lister = _make_window_lister()
+        self._known_windows: set[str] | None = None  # None until first poll seeds it
         self.raw_q: queue.Queue[RawEvent] = queue.Queue()
         self._stop = threading.Event()
         # A click whose screenshot is deferred until the UI settles:
@@ -271,6 +308,18 @@ class Daemon:
                     )
                 )
             self._last_app_title = cur
+
+            # New top-level window / dialog detection.
+            windows = self.window_lister()
+            ids = set(windows)
+            if self._known_windows is None:
+                self._known_windows = ids  # seed without emitting at startup
+            else:
+                for wid in new_windows(self._known_windows, ids):
+                    self.raw_q.put(
+                        RawEvent(kind="window_open", target_label=windows.get(wid, ""))
+                    )
+                self._known_windows = ids
 
     # -- main loop ---------------------------------------------------------
 

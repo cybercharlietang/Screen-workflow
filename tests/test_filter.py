@@ -17,6 +17,10 @@ class TestKeepers:
         r = classify(E("heartbeat"))
         assert r.keep and r.trigger is TriggerType.HEARTBEAT
 
+    def test_window_open(self) -> None:
+        r = classify(E("window_open", target_label="Confirm delete"))
+        assert r.keep and r.trigger is TriggerType.WINDOW_OPEN
+
     def test_window_focus(self) -> None:
         r = classify(E("window_focus", target_label="Outlook"))
         assert r.keep and r.trigger is TriggerType.WINDOW_FOCUS

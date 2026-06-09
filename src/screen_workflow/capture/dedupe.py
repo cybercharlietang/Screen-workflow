@@ -151,6 +151,12 @@ class Deduper:
         trigger: TriggerType,
         window_key: str,
     ) -> bool:
+        # A new window / dialog is a decision point — always keep it. Dropping
+        # one (a false negative) is far costlier than an extra frame.
+        if trigger is TriggerType.WINDOW_OPEN:
+            self._remember(self._fingerprint(image))
+            return True
+
         if trigger in _CONTEXT_KEEP:
             return self._keep_context(image, trigger, window_key)
 

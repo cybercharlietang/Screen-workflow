@@ -26,6 +26,7 @@ class TriggerType(str, Enum):
     """Why the capture layer decided this frame was worth keeping."""
 
     WINDOW_FOCUS = "window_focus"
+    WINDOW_OPEN = "window_open"  # a new top-level window / dialog appeared
     CLICK = "click"
     PASTE = "paste"
     SAVE = "save"

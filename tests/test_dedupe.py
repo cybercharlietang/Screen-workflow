@@ -83,6 +83,12 @@ class TestContextFrames:
         d = Deduper()
         assert d.should_keep(_solid((50, 50, 50)), TriggerType.SUBMIT, "w1") is True
 
+    def test_window_open_always_kept_even_if_identical(self) -> None:
+        # A dialog is a decision point — never deduped away, asymmetric payoff.
+        d = Deduper()
+        d.should_keep(_solid((70, 70, 70)), TriggerType.WINDOW_OPEN, "App␟Dialog")
+        assert d.should_keep(_solid((70, 70, 70)), TriggerType.WINDOW_OPEN, "App␟Dialog") is True
+
 
 class TestRingBuffer:
     def test_aba_flip_drops_returning_frame(self) -> None:

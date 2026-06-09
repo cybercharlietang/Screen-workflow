@@ -48,9 +48,13 @@ MAX_IMAGES_PER_CHUNK = 6
 # only down-encode images that exceed this — smaller PNGs pass through
 # at full quality.
 MAX_PER_IMAGE_BYTES = 4 * 1024 * 1024
-# And for multi-image requests, each image's largest dimension must be
-# <= 2000 px. We resize anything that exceeds this regardless of file size.
-MAX_IMAGE_DIMENSION_PX = 2000
+# Default long-edge cap we downscale every screenshot to before sending.
+# Anthropic internally scales any image down to ~1568 px / ~1.15 MP before
+# tokenizing, so sending larger costs the SAME tokens (just wasted upload).
+# 1568 is therefore a free default. Setting it LOWER (e.g. 1280, 1024) is the
+# real image-token lever — at the cost of legibility for small on-screen text.
+# Tune via --max-image-px and measure label quality.
+DEFAULT_MAX_IMAGE_PX = 1568
 
 
 @dataclass
@@ -140,65 +144,49 @@ def _select_images(
     return selected, dropped
 
 
-def _shrink_for_anthropic(path: Path) -> tuple[bytes, str]:
-    """Encode the screenshot to fit Anthropic's limits with minimum pixel loss.
+def _shrink_for_anthropic(path: Path, max_px: int = DEFAULT_MAX_IMAGE_PX) -> tuple[bytes, str]:
+    """Encode the screenshot, downscaling to <= ``max_px`` on the long edge.
 
-    Strategy (in order — preserve resolution as long as possible):
-      1. Raw PNG, if under both 5 MB and (only when batch is "many-image")
-         the 2000 px dimension cap.
-      2. JPEG at original dimensions, decreasing quality (95 → 80) until
-         <= 5 MB. Preserves spatial resolution; only loses some quality.
-      3. JPEG with progressive downscaling, last resort.
+    - If the image is already within ``max_px`` and the per-image byte cap, the
+      raw PNG is sent untouched (lossless).
+    - Otherwise it is downscaled to ``max_px`` (when larger) and/or re-encoded
+      as JPEG at decreasing quality until it fits the byte cap.
 
-    The 2000 px cap only matters if the batch will be "many-image". We
-    don't know the threshold exactly, but it's around ~10 images. The
-    chunker keeps us under that, so we only enforce the dimension cap
-    when we already need to compress for size anyway.
+    ``max_px`` is the cost/fidelity knob: Anthropic scales anything above
+    ~1568 px down anyway (so 1568 is free), but going below 1568 genuinely cuts
+    image tokens at the expense of small-text legibility.
     """
     raw = path.read_bytes()
-    with Image.open(path) as im:
-        w, h = im.width, im.height
+    with Image.open(path) as im0:
+        w, h = im0.width, im0.height
+        long_edge = max(w, h)
+        if long_edge <= max_px and len(raw) <= MAX_PER_IMAGE_BYTES:
+            return raw, "image/png"  # small enough already — lossless
+        im = im0.convert("RGB")
 
-    if len(raw) <= MAX_PER_IMAGE_BYTES:
-        return raw, "image/png"  # full PNG — preferred path
+    if long_edge > max_px:
+        im.thumbnail((max_px, max_px), Image.LANCZOS)
 
-    # Step 2: JPEG at original size, decreasing quality.
-    with Image.open(path) as im:
-        im = im.convert("RGB")
-        for quality in (95, 90, 85, 80):
-            buf = io.BytesIO()
-            im.save(buf, format="JPEG", quality=quality, optimize=True)
-            if buf.tell() <= MAX_PER_IMAGE_BYTES:
+    buf = io.BytesIO()
+    for quality in (90, 85, 80, 70):
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=quality, optimize=True)
+        if buf.tell() <= MAX_PER_IMAGE_BYTES:
+            if long_edge > max_px:
                 log.info(
-                    "compressed %s: %dx%d PNG %d KB -> JPEG q=%d (same size) %d KB",
-                    path.name, w, h, len(raw) // 1024, quality, buf.tell() // 1024,
+                    "resized %s: %dx%d -> %dx%d JPEG q=%d %dKB",
+                    path.name, w, h, im.width, im.height, quality, buf.tell() // 1024,
                 )
-                return buf.getvalue(), "image/jpeg"
+            return buf.getvalue(), "image/jpeg"
 
-        # Step 3: progressive downscale + JPEG. Hits the dim cap too.
-        for max_px in (MAX_IMAGE_DIMENSION_PX - 100, 1600, 1280, 960, 720):
-            for quality in (90, 85, 80, 70):
-                im2 = im.copy()
-                im2.thumbnail((max_px, max_px), Image.LANCZOS)
-                buf = io.BytesIO()
-                im2.save(buf, format="JPEG", quality=quality, optimize=True)
-                if buf.tell() <= MAX_PER_IMAGE_BYTES and max(im2.size) <= MAX_IMAGE_DIMENSION_PX:
-                    log.info(
-                        "resized %s: %dx%d PNG %d KB -> JPEG q=%d %dx%d %d KB",
-                        path.name, w, h, len(raw) // 1024,
-                        quality, im2.width, im2.height, buf.tell() // 1024,
-                    )
-                    return buf.getvalue(), "image/jpeg"
-
-    log.warning("could not shrink %s under caps; returning best effort", path)
+    log.warning("could not shrink %s under byte cap; returning best effort", path)
     return buf.getvalue(), "image/jpeg"
 
 
-def _image_block(event: Event, screens_root: Path) -> dict | None:
+def _image_block(event: Event, screens_root: Path, max_px: int = DEFAULT_MAX_IMAGE_PX) -> dict | None:
     """Encode the screenshot as a base64 image content block.
 
-    Full-quality PNG by default; auto-compresses if the original would
-    exceed Anthropic's per-image 5 MB cap.
+    Downscaled to ``max_px`` on the long edge (see ``_shrink_for_anthropic``).
     """
     rel = event.screenshot_path.replace("\\", "/")  # Win/POSIX portability
     p = screens_root / rel
@@ -206,7 +194,7 @@ def _image_block(event: Event, screens_root: Path) -> dict | None:
         log.warning("screenshot missing: %s", p)
         return None
     try:
-        img_bytes, media_type = _shrink_for_anthropic(p)
+        img_bytes, media_type = _shrink_for_anthropic(p, max_px)
     except Exception:  # noqa: BLE001
         log.exception("failed to encode %s", p)
         return None
@@ -221,13 +209,17 @@ def _image_block(event: Event, screens_root: Path) -> dict | None:
     }
 
 
-def build_batch(events: list[Event], screens_root: Path) -> Batch:
+def build_batch(
+    events: list[Event],
+    screens_root: Path,
+    max_image_px: int = DEFAULT_MAX_IMAGE_PX,
+) -> Batch:
     """Single-batch convenience wrapper — collapses all chunks into one batch.
 
     Useful for tests and small sessions. For real sessions prefer
     ``build_batches`` which splits into chunks under Anthropic's 32 MB cap.
     """
-    chunks = build_batches(events, screens_root)
+    chunks = build_batches(events, screens_root, max_image_px=max_image_px)
     if not chunks:
         return Batch(event_log_text=_event_log_table(events))
     if len(chunks) == 1:
@@ -248,7 +240,11 @@ def build_batch(events: list[Event], screens_root: Path) -> Batch:
     return merged
 
 
-def build_batches(events: list[Event], screens_root: Path) -> list[Batch]:
+def build_batches(
+    events: list[Event],
+    screens_root: Path,
+    max_image_px: int = DEFAULT_MAX_IMAGE_PX,
+) -> list[Batch]:
     """Split a session into one or more Batches that each fit Anthropic's cap.
 
     Each returned Batch contains:
@@ -281,7 +277,7 @@ def build_batches(events: list[Event], screens_root: Path) -> list[Batch]:
     # Build raw image blocks once (PIL/base64 happens here), then chunk
     image_records: list[tuple[Event, dict, dict, int]] = []
     for e in image_events:
-        block = _image_block(e, screens_root)
+        block = _image_block(e, screens_root, max_image_px)
         if block is None:
             continue
         marker = {

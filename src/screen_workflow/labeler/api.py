@@ -26,7 +26,7 @@ from pydantic import ValidationError
 if TYPE_CHECKING:
     from screen_workflow.cost_monitor import CostMonitor
 
-from screen_workflow.labeler.batch import build_batches
+from screen_workflow.labeler.batch import DEFAULT_MAX_IMAGE_PX, build_batches
 from screen_workflow.schemas import (
     CAGELabel,
     Event,
@@ -547,6 +547,7 @@ def process_session(
     api_key: str | None = None,
     dry_run: bool = False,
     cost_monitor: "CostMonitor | None" = None,
+    max_image_px: int = DEFAULT_MAX_IMAGE_PX,
 ) -> tuple[dict[str, Workflow], list[Observation], int]:
     """Run Claude on one session, splitting into multiple chunks if needed.
 
@@ -564,7 +565,7 @@ def process_session(
         return {}, [], 0
     events_by_id = {e.event_id: e for e in events}
 
-    batches = build_batches(events, store.screens_dir)
+    batches = build_batches(events, store.screens_dir, max_image_px=max_image_px)
     log.info(
         "labeling session %s in %d chunk(s); total %d events",
         session.session_id,
@@ -693,6 +694,7 @@ def process_all_unprocessed_sessions(
     model: str = DEFAULT_MODEL,
     dry_run: bool = False,
     cost_monitor: "CostMonitor | None" = None,
+    max_image_px: int = DEFAULT_MAX_IMAGE_PX,
 ) -> int:
     """Process every session not yet sent through the labeler.
 
@@ -705,7 +707,8 @@ def process_all_unprocessed_sessions(
         if session.session_id in labeled:
             continue
         process_session(
-            store, session, model=model, dry_run=dry_run, cost_monitor=cost_monitor
+            store, session, model=model, dry_run=dry_run,
+            cost_monitor=cost_monitor, max_image_px=max_image_px,
         )
         if not dry_run:
             store.mark_session_labeled(session.session_id)
@@ -720,6 +723,10 @@ def main() -> int:
     p.add_argument("--root", default="./local_data")
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--max-image-px", type=int, default=DEFAULT_MAX_IMAGE_PX,
+        help="downscale screenshots to this long-edge px before sending",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
@@ -728,7 +735,9 @@ def main() -> int:
         format="%(levelname)s %(name)s: %(message)s",
     )
     store = Store(Path(args.root))
-    n = process_all_unprocessed_sessions(store, model=args.model, dry_run=args.dry_run)
+    n = process_all_unprocessed_sessions(
+        store, model=args.model, dry_run=args.dry_run, max_image_px=args.max_image_px
+    )
     store.close()
     print(f"processed {n} new session(s)")
     return 0

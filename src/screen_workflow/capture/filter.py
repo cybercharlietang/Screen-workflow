@@ -66,6 +66,14 @@ def classify(event: RawEvent, *, typing_active: bool = False) -> FilterResult:
                 trigger=TriggerType.WINDOW_FOCUS,
                 target_label=event.target_label,
             )
+        case "window_open":
+            # A new top-level window / dialog — a decision point. High signal,
+            # rare; always worth a frame.
+            return FilterResult(
+                keep=True,
+                trigger=TriggerType.WINDOW_OPEN,
+                target_label=event.target_label,
+            )
         case "url_change":
             # Wired end-to-end (filter + dedupe) but NOT currently emitted: no
             # event source produces "url_change" yet. Browser navigations are

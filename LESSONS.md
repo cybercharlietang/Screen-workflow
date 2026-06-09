@@ -313,3 +313,40 @@ engineering decision.
 **How to apply.** Get the redaction list signed off before serious code
 investment. The redactor in `enrich/` should treat the list as
 configuration, not constants, so we can change it without a code change.
+
+---
+
+## L17 — Real cost anatomy from a 2-hour live run (2026-06-09)
+
+**Rule.** Cost tracks **activity density, not wall-clock** — each kept frame
+is ~1,500 input tokens, so a busy hour costs more than two idle ones. A 2-h
+all-noise run: 66 frames, 16 sessions, 20 calls, **$0.62** on Sonnet 4.6
+(~$0.04/session); a busier hour hit ~$1.60. Both far under the $30/hr guard.
+Variance is benign and proportional to how much the user did.
+
+**Why (the input-token breakdown, 146K in / 12K out):**
+- **Images ≈ 60%.** Screenshots were 4K (3840×2160), but **4K does not cost
+  extra tokens** — Anthropic auto-scales any image to ~1568 px / ~1.15 MP
+  *before* billing, so 4K and 1568 px cost the same ~1,500 tokens. 4K only
+  wastes upload. The real image-token lever is downscaling **below** 1568 px
+  (now the `--max-image-px` knob; 1568 is free, 1280≈−20%, with a legibility
+  floor for small text — A/B it, don't guess).
+- **Repeated overhead ≈ 40%.** System prompt + workflow directory + event-log
+  are re-sent every call (~2,900 tok floor × 20 calls). This is what prompt
+  caching attacks once the directory grows, and what trimming per-call
+  verbosity attacks now.
+- **Output is ~8% of tokens but ~29% of *cost*** (output is 5× input price), so
+  trimming verbose JSON (`rationale`, etc.) is an outsized, easy lever.
+
+**Also:** on pure noise the labeler correctly tagged everything `noise` (no
+hallucinated procurement workflows) — good precision signal. NB: L16's
+$15/$75 Opus figure is stale Claude-3 pricing; Opus 4.7 is $5/$25, Sonnet 4.6
+$3/$15. Every run now writes a `runs/run_<stamp>.json` + appends `runs.jsonl`
+(see `analytics/metrics.py`) so cost/keep-rate/noise-ratio are comparable
+across config changes.
+
+**How to apply.** Cost-reduction order, cheapest first: (1) fewer frames
+(dedup — ring buffer + window-focus gate + click-settle, all just shipped),
+(2) trim output JSON verbosity, (3) trim/cache per-call overhead, (4)
+`--max-image-px` below 1568 with a legibility check. Measure each against
+`runs.jsonl`, not intuition.
