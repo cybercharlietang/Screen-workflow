@@ -27,7 +27,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from screen_workflow.capture.dedupe import Deduper
+from screen_workflow.capture.dedupe import (
+    HASH_MODE_PERCEPTUAL,
+    HASH_MODES,
+    Deduper,
+)
 from screen_workflow.capture.filter import RawEvent, classify
 from screen_workflow.schemas import Event, InputEvent, TriggerType
 from screen_workflow.storage.db import Store
@@ -37,6 +41,11 @@ log = logging.getLogger(__name__)
 
 HEARTBEAT_SECONDS = 30.0
 ACTIVE_WINDOW_POLL_SECONDS = 1.0
+# Capture a click's screenshot this long after the click, so the UI has
+# repainted and we record the *result* of the click, not the pre-click frame.
+# A second click before the deadline resets it, collapsing a rapid burst into
+# one capture of the final settled state.
+CLICK_SETTLE_SECONDS = 0.35
 
 
 def _now() -> datetime:
@@ -202,13 +211,16 @@ def _start_pynput_listeners(out_q: queue.Queue[RawEvent]) -> tuple:
 
 
 class Daemon:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, hash_mode: str = "perceptual") -> None:
         self.store = Store(root)
         self.shotter = Screenshotter(self.store.screens_dir)
-        self.deduper = Deduper()
+        self.deduper = Deduper(hash_mode=hash_mode)
         self.probe = _make_active_window_probe()
         self.raw_q: queue.Queue[RawEvent] = queue.Queue()
         self._stop = threading.Event()
+        # A click whose screenshot is deferred until the UI settles:
+        # (trigger, target_label, monotonic deadline). Coalesces rapid clicks.
+        self._pending_click: tuple[TriggerType, str | None, float] | None = None
         self._last_app_title: tuple[str, str] | None = None
         self._status_path = self.store.root / "_status.json"
         self._events_captured = 0
@@ -289,16 +301,37 @@ class Daemon:
                 if time.monotonic() - last_status_write > 1.0:
                     self._write_status(alive=True, listeners_ok=listeners_ok, last_error=last_error)
                     last_status_write = time.monotonic()
+                # Fire a deferred click capture once its settle deadline passes.
+                if (
+                    self._pending_click is not None
+                    and time.monotonic() >= self._pending_click[2]
+                ):
+                    trig, label, _ = self._pending_click
+                    self._pending_click = None
+                    self._capture(trig, label)
                 try:
-                    raw = self.raw_q.get(timeout=0.25)
+                    raw = self.raw_q.get(timeout=0.1)
                 except queue.Empty:
                     continue
                 result = classify(raw)
                 if not result.keep or result.trigger is None:
                     continue
+                if result.trigger is TriggerType.CLICK:
+                    # Defer + coalesce: capture the settled post-click state.
+                    self._pending_click = (
+                        result.trigger,
+                        result.target_label,
+                        time.monotonic() + CLICK_SETTLE_SECONDS,
+                    )
+                    continue
                 self._capture(result.trigger, result.target_label)
         finally:
             self._stop.set()
+            if self._pending_click is not None:
+                trig, label, _ = self._pending_click
+                self._pending_click = None
+                self._capture(trig, label)
+            log.info("dedup stats: %s", self.deduper.stats())
             if ml is not None:
                 ml.stop()
             if kl is not None:
@@ -344,6 +377,12 @@ def main() -> int:
     p = argparse.ArgumentParser(prog="screen-workflowd")
     p.add_argument("--root", default="./local_data", help="storage root dir")
     p.add_argument("--seconds", type=float, default=None, help="run for N seconds then exit")
+    p.add_argument(
+        "--hash-mode",
+        choices=HASH_MODES,
+        default=HASH_MODE_PERCEPTUAL,
+        help="dedupe by perceptual hash (cheaper, not exact) or exact pixels",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
     logging.basicConfig(
@@ -352,7 +391,7 @@ def main() -> int:
     )
     for noisy in ("PIL", "PIL.PngImagePlugin", "PIL.Image", "PIL.TiffImagePlugin"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
-    Daemon(Path(args.root)).run(seconds=args.seconds)
+    Daemon(Path(args.root), hash_mode=args.hash_mode).run(seconds=args.seconds)
     return 0
 
 

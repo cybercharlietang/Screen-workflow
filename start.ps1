@@ -13,7 +13,9 @@
 param(
     [double]$Seconds = 900,
     [switch]$Reset,
-    [string]$ApiKey = ""
+    [string]$ApiKey = "",
+    [ValidateSet("perceptual", "exact")]
+    [string]$HashMode = "perceptual"
 )
 
 $ErrorActionPreference = "Stop"
@@ -48,4 +50,4 @@ Get-ChildItem -Path . -Recurse -Filter __pycache__ -Directory -ErrorAction Silen
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
 . .\.venv\Scripts\Activate.ps1
-screen-workflow-live --root .\local_data --seconds $Seconds --verbose
+screen-workflow-live --root .\local_data --seconds $Seconds --hash-mode $HashMode --verbose

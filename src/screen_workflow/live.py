@@ -248,6 +248,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="capture + segment only; do not call Claude (free dry runs)",
     )
+    p.add_argument(
+        "--hash-mode",
+        choices=("perceptual", "exact"),
+        default="perceptual",
+        help="frame dedupe: perceptual hash (cheaper, not exact) or exact pixels",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
@@ -306,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
     daemon_thread = None
     pipeline_threads: list[threading.Thread] = []
     if not args.no_daemon:
-        daemon = Daemon(root)
+        daemon = Daemon(root, hash_mode=args.hash_mode)
         daemon_thread = threading.Thread(
             target=daemon.run, kwargs={"seconds": args.seconds}, daemon=True
         )
@@ -348,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Segmenter:               every {SEGMENTER_INTERVAL_SECONDS:.0f}s")
         print(f"  Flush to labeler:        every {FLUSH_MAX_EVENTS} events "
               f"or {FLUSH_MAX_SECONDS:.0f}s of activity")
+        print(f"  Frame dedupe:            {args.hash_mode} hash")
     print(f"  Re-rendering every:      {RERENDER_INTERVAL_SECONDS:.0f}s")
     print(f"  Labeler:                 {labeler_status}")
     if labeler_enabled:

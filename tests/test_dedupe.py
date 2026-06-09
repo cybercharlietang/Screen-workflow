@@ -129,6 +129,48 @@ class TestMutationDedup:
         assert d.should_keep(_solid((80, 80, 80)), TriggerType.PASTE) is False
 
 
+class TestHashModeExact:
+    def test_pixel_identical_dropped(self) -> None:
+        d = Deduper(hash_mode="exact")
+        d.should_keep(_solid((100, 100, 100)), TriggerType.HEARTBEAT)
+        # byte-for-byte identical -> dropped
+        assert d.should_keep(_solid((100, 100, 100)), TriggerType.HEARTBEAT) is False
+
+    def test_one_pixel_difference_kept(self) -> None:
+        """Exact mode keeps a frame that perceptual hashing would have dropped:
+        a tiny change pHash blurs away is a real, distinct frame here."""
+        base = _solid((100, 100, 100))
+        nudged = base.copy()
+        nudged.putpixel((0, 0), (101, 100, 100))  # single-channel, single-pixel
+        d_exact = Deduper(hash_mode="exact")
+        d_exact.should_keep(base, TriggerType.HEARTBEAT)
+        assert d_exact.should_keep(nudged, TriggerType.HEARTBEAT) is True
+        # perceptual hashing collapses the same pair
+        d_phash = Deduper(hash_mode="perceptual")
+        d_phash.should_keep(base, TriggerType.HEARTBEAT)
+        assert d_phash.should_keep(nudged, TriggerType.HEARTBEAT) is False
+
+    def test_invalid_mode_rejected(self) -> None:
+        import pytest
+
+        with pytest.raises(ValueError):
+            Deduper(hash_mode="fuzzy")
+
+
+class TestStats:
+    def test_counts_seen_kept_dropped(self) -> None:
+        d = Deduper()
+        d.should_keep(_solid((100, 100, 100)), TriggerType.HEARTBEAT)  # kept
+        d.should_keep(_solid((100, 100, 100)), TriggerType.HEARTBEAT)  # dropped
+        s = d.stats()
+        assert s["seen"] == 2
+        assert s["kept"] == 1
+        assert s["dropped"] == 1
+        assert s["keep_rate"] == 0.5
+        assert s["mode"] == "perceptual"
+        assert s["avg_hash_ms"] >= 0.0
+
+
 class TestClick:
     def test_first_click_kept(self) -> None:
         d = Deduper()
